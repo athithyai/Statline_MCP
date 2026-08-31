@@ -1,0 +1,69 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # CBS changes its feeds without warning and this server depends on two
+    # undocumented quirks of them, so run weekly to catch upstream drift.
+    - cron: "17 6 * * 1"
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff==0.9.10
+      - run: ruff check .
+      - run: ruff format --check .
+
+  smoke:
+    runs-on: ubuntu-latest
+    # Hits the live CBS API, which is public but occasionally slow.
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Import check (catches a broken entrypoint before deploy)
+        run: python -c "from server import mcp; print(mcp.name)"
+      - name: End-to-end smoke test against CBS
+        run: python smoke.py
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t mcp-statline:ci .
+      - name: Boot the container and probe it
+        run: |
+          docker run -d --name statline -p 8000:8000 mcp-statline:ci
+          for i in $(seq 1 30); do
+            if docker exec statline python scripts/health_check.py --transport-only; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "server did not become healthy"
+          docker logs statline
+          exit 1
+      - name: Container logs
+        if: always()
+        run: docker logs statline || true

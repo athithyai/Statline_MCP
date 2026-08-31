@@ -56,6 +56,46 @@ async def main() -> int:
         _, text, data = await call("search_tables", query="bevolking", limit=3)
         check("returns tables", data.get("count", 0) > 0, text[:200])
 
+        _, text, data = await call("search_tables", query="population", language="en", limit=5)
+        check("english search returns english tables", data.get("count", 0) > 0, text[:200])
+        check(
+            "language filter is honoured",
+            all(t["Language"] == "en" for t in data.get("tables", [])),
+            str([t.get("Language") for t in data.get("tables", [])]),
+        )
+        check(
+            "english results carry ENG identifiers",
+            all(t["Identifier"].upper().endswith("ENG") for t in data.get("tables", [])),
+            str([t["Identifier"] for t in data.get("tables", [])]),
+        )
+
+        _, text, data = await call("search_tables", query="bevolking", language="nl", limit=5)
+        check(
+            "dutch filter is honoured",
+            data.get("count", 0) > 0 and all(t["Language"] == "nl" for t in data.get("tables", [])),
+            text[:200],
+        )
+
+        # The filter's guarantee is about the *table's* language, not the keyword's:
+        # an English table may still match a Dutch word if its description quotes a
+        # Dutch source title (37259eng does exactly this), so assert the invariant
+        # that actually holds rather than an empty result.
+        _, text, data = await call("search_tables", query="bevolking", language="en", limit=5)
+        check(
+            "cross-language hits stay inside the requested language",
+            all(t["Language"] == "en" for t in data.get("tables", [])),
+            str([(t["Identifier"], t["Language"]) for t in data.get("tables", [])]),
+        )
+
+        _, text, data = await call(
+            "search_tables", query="zzzznotarealword", language="en", limit=5
+        )
+        check(
+            "empty english search explains the nl fallback",
+            data.get("count") == 0 and "language='nl'" in text,
+            text[:200],
+        )
+
         print("\nget_table_info")
         _, text, data = await call("get_table_info", table_id="83583NED")
         check("has dimensions", len(data.get("dimensions", [])) >= 3, text[:200])
@@ -136,14 +176,10 @@ async def main() -> int:
         result, text, _ = await call("get_data", table_id="nope", filters={})
         check("rejects bad table id", result.is_error, text[:120])
 
-        result, text, _ = await call(
-            "get_data", table_id="83583NED", filters={"NotADim": ["x"]}
-        )
+        result, text, _ = await call("get_data", table_id="83583NED", filters={"NotADim": ["x"]})
         check("rejects unknown dimension", result.is_error and "dimension" in text, text[:160])
 
-        result, text, _ = await call(
-            "get_data", table_id="83583NED", measures=["Bogus"], limit=1
-        )
+        result, text, _ = await call("get_data", table_id="83583NED", measures=["Bogus"], limit=1)
         check("rejects unknown measure", result.is_error, text[:160])
 
         result, text, data = await call(
@@ -204,7 +240,7 @@ async def main() -> int:
                     break
                 nxt.extend(c["id"] for c in themed.get("children", []))
             frontier = nxt
-        check("English theme descent reaches tables", bool(ids), f"frontier exhausted")
+        check("English theme descent reaches tables", bool(ids), "frontier exhausted")
 
         if ids:
             result, text, info = await call("get_table_info", table_id=ids[0])
@@ -215,8 +251,9 @@ async def main() -> int:
             )
 
         print("\nvalidation")
-        result, text, _ = await call("get_dimension_codes", table_id="83583NED",
-                                     dimension="Perioden", limit=9999)
+        result, text, _ = await call(
+            "get_dimension_codes", table_id="83583NED", dimension="Perioden", limit=9999
+        )
         check("limit bound is enforced", result.is_error, text[:120])
 
     await cbs.close_client()

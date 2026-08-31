@@ -30,16 +30,24 @@ mcp = FastMCP(
     name="mcp-statline",
     version="0.2.0",
     instructions=(
-        "Query CBS StatLine, the open data platform of Statistics Netherlands. "
-        "Most tables, dimensions and codes are in Dutch. The normal flow is: find a "
-        "table id, then get_table_info to see its dimensions and measures, then "
-        "get_dimension_codes to look up the codes you need, then get_data to pull "
-        "observations. To find a table you have two routes: search_tables matches "
-        "keywords against titles, which needs Dutch words; browse_themes walks the CBS "
-        "subject taxonomy, which has an English tree, so prefer it when the question is "
-        "in English or the Dutch term is uncertain. Dimension codes are opaque (T001081 "
-        "is a total, 2023JJ00 is the year 2023, GM0363 is Amsterdam) - always look them "
-        "up rather than guessing."
+        "Query CBS StatLine, the open data platform of Statistics Netherlands.\n\n"
+        "LANGUAGE. The catalog is bilingual but lopsided: ~4900 Dutch tables and ~1100 "
+        "English ones, the English set being a translated subset with identifiers ending "
+        "ENG. A table exists in one language only - its title, dimension names and code "
+        "labels are all in that language - so keywords in one language rarely match "
+        "tables in the other (descriptions occasionally quote a Dutch source title, "
+        "which is the exception). Prefer English tables when the user writes English and a "
+        "translated table covers the topic; fall back to Dutch for anything the English "
+        "subset does not reach, and translate the labels when you report the answer.\n\n"
+        "FINDING A TABLE. Two routes, which fail differently. search_tables matches "
+        "keywords against titles, so it needs a word in the right language - pass "
+        "`language` to match your keywords. browse_themes walks the CBS subject "
+        "taxonomy, which has a full English tree, so it works from an English topic "
+        "without translating anything. If one route comes up empty, try the other.\n\n"
+        "THEN. get_table_info to see the table's dimensions and measures, "
+        "get_dimension_codes to look up the codes you need, get_data to pull "
+        "observations. Dimension codes are opaque (T001081 is a total, 2023JJ00 is the "
+        "year 2023, GM0363 is Amsterdam) - always look them up rather than guessing."
     ),
 )
 
@@ -83,42 +91,68 @@ def _as_table(rows: list[dict[str, Any]], columns: list[str]) -> str:
     annotations={"readOnlyHint": True, "openWorldHint": True},
     description=(
         "Search the CBS StatLine catalog for tables by keyword and return their "
-        "identifiers. StatLine titles and descriptions are in Dutch, so Dutch keywords "
-        "match best (bevolking, werkloosheid, inkomen, bedrijven, criminaliteit, "
-        "energie). All words must match. Start here when you do not already know the "
-        "table id."
+        "identifiers. The catalog is bilingual: ~4900 Dutch tables and ~1100 English "
+        "ones (a translated subset, identifiers ending ENG). A title is written only in "
+        "its table's own language, so keywords in one language rarely match tables in "
+        "the other - set `language` to search one side cleanly. Dutch gives far wider "
+        "coverage "
+        "(bevolking, werkloosheid, inkomen, bedrijven, criminaliteit, energie); English "
+        "covers less but needs no translation. All words must match. If a keyword search "
+        "comes up empty, try browse_themes instead."
     ),
 )
 async def search_tables(
     query: Annotated[
         str,
-        Field(description="Keywords matched against table title and description, e.g. 'bevolking regio'."),
+        Field(
+            description="Keywords matched against table title and description, e.g. 'bevolking regio'."
+        ),
     ],
+    language: Annotated[
+        Literal["nl", "en"] | None,
+        Field(
+            description=(
+                "Restrict to Dutch ('nl') or English ('en') tables. Match this to the "
+                "language of your keywords. Both are searched if omitted."
+            )
+        ),
+    ] = None,
     limit: Annotated[int, Field(description="Maximum tables to return.", ge=1, le=50)] = 10,
 ) -> ToolResult:
     try:
-        rows = await cbs.search_tables(query, limit)
+        rows = await cbs.search_tables(query, limit, language)
     except CbsError as err:
         raise ToolError(str(err)) from err
 
     if not rows:
+        hint = (
+            "the English catalog is a translated subset, so try language='nl' with a Dutch keyword"
+            if language == "en"
+            else "most titles are Dutch, so try a Dutch keyword"
+        )
         return _ok(
-            f'No StatLine tables matched "{query}". Titles are in Dutch - try a Dutch '
-            f"keyword, or fewer words (every word must match).",
-            {"query": query, "count": 0, "tables": []},
+            f'No StatLine tables matched "{query}"'
+            + (f" in {language}" if language else "")
+            + f". Note that {hint}, use fewer words (every word must match), or "
+            f"browse_themes to navigate by topic instead.",
+            {"query": query, "language": language, "count": 0, "tables": []},
         )
 
     blocks = [
         f"**{r['Identifier']}** - {r['Title'].strip()}\n"
-        f"  period: {r.get('Period') or '?'} | frequency: {r.get('Frequency') or '?'} | "
+        f"  [{r.get('Language') or '?'}] period: {r.get('Period') or '?'} | "
+        f"frequency: {r.get('Frequency') or '?'} | "
         f"rows: {r.get('RecordCount') or '?'} | updated: {(r.get('Updated') or '')[:10]}\n"
         f"  {_truncate(r.get('ShortDescription'), 220)}"
         for r in rows
     ]
     return _ok(
-        f'{len(rows)} table(s) matching "{query}":\n\n' + "\n\n".join(blocks) +
-        "\n\nNext: get_table_info with one of these identifiers.",
-        {"query": query, "count": len(rows), "tables": rows},
+        f'{len(rows)} table(s) matching "{query}"'
+        + (f" in {language}" if language else "")
+        + ":\n\n"
+        + "\n\n".join(blocks)
+        + "\n\nNext: get_table_info with one of these identifiers.",
+        {"query": query, "language": language, "count": len(rows), "tables": rows},
     )
 
 
@@ -139,9 +173,7 @@ async def get_table_info(
 ) -> ToolResult:
     try:
         tid = cbs.assert_table_id(table_id)
-        info, props = await asyncio.gather(
-            cbs.get_table_info(tid), cbs.get_data_properties(tid)
-        )
+        info, props = await asyncio.gather(cbs.get_table_info(tid), cbs.get_data_properties(tid))
     except CbsError as err:
         raise ToolError(str(err)) from err
 
@@ -162,7 +194,8 @@ async def get_table_info(
 
     text = (
         f"# {info['Title'].strip()} ({tid})\n\n"
-        f"period: {info.get('Period') or '?'} | frequency: {info.get('Frequency') or '?'} | "
+        f"language: {info.get('Language') or '?'} | period: {info.get('Period') or '?'} | "
+        f"frequency: {info.get('Frequency') or '?'} | "
         f"status: {info.get('OutputStatus') or '?'} | modified: {(info.get('Modified') or '')[:10]}\n"
         f"source: {info.get('Source') or 'CBS'}\n"
         f"statline: {cbs.statline_url(tid)}\n\n"
@@ -205,7 +238,8 @@ async def get_table_info(
 async def get_dimension_codes(
     table_id: Annotated[str, Field(description="StatLine table identifier, e.g. '83583NED'.")],
     dimension: Annotated[
-        str, Field(description="Dimension key exactly as returned by get_table_info, e.g. 'Perioden'.")
+        str,
+        Field(description="Dimension key exactly as returned by get_table_info, e.g. 'Perioden'."),
     ],
     search: Annotated[
         str | None,
@@ -222,9 +256,7 @@ async def get_dimension_codes(
 
     if not codes:
         detail = (
-            f' matching "{search}".'
-            if search
-            else ". Check the dimension key with get_table_info."
+            f' matching "{search}".' if search else ". Check the dimension key with get_table_info."
         )
         return _ok(
             f"No codes in `{dimension}` of {tid}{detail}",
@@ -232,9 +264,7 @@ async def get_dimension_codes(
         )
 
     lines = "\n".join(f"- `{c['Key']}` - {c['Title']}" for c in codes)
-    more = (
-        f"\n\n(limit reached - page with offset={offset + limit})" if len(codes) == limit else ""
-    )
+    more = f"\n\n(limit reached - page with offset={offset + limit})" if len(codes) == limit else ""
     return _ok(
         f"{len(codes)} code(s) in `{dimension}` of {tid}"
         + (f' matching "{search}"' if search else "")
@@ -340,6 +370,7 @@ async def get_data(
                 zip(
                     present,
                     await asyncio.gather(*(cbs.get_code_labels(tid, k) for k in present)),
+                    strict=False,
                 )
             )
             for row in result.rows:
@@ -421,9 +452,9 @@ async def browse_themes(
     # --- search: match anywhere in the tree, showing each hit's full path ---
     if search:
         needle = search.strip().lower()
-        hits = [
-            t for t in themes if needle in (t.get("Title") or "").lower() and in_language(t)
-        ][:limit]
+        hits = [t for t in themes if needle in (t.get("Title") or "").lower() and in_language(t)][
+            :limit
+        ]
         if not hits:
             return _ok(
                 f'No themes matched "{search}". Try a broader word, or call '
@@ -510,7 +541,11 @@ async def browse_themes(
         parts.append("\n(This theme has no sub-themes and no tables filed directly under it.)")
     parts.append(
         "\nNext: "
-        + ("get_table_info with a table identifier." if tables else "browse_themes with a sub-theme id.")
+        + (
+            "get_table_info with a table identifier."
+            if tables
+            else "browse_themes with a sub-theme id."
+        )
     )
 
     return _ok(

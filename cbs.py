@@ -100,24 +100,47 @@ async def _get_json(url: str, params: dict[str, Any] | None = None) -> dict[str,
 # ------------------------------------------------------------------ catalog --
 
 
-async def search_tables(terms: str, top: int) -> list[dict[str, Any]]:
-    """Search the StatLine catalog. Every word must match title or description."""
+async def search_tables(terms: str, top: int, language: str | None = None) -> list[dict[str, Any]]:
+    """Search the StatLine catalog. Every word must match title or description.
+
+    CBS publishes the catalog in two languages - about 4900 Dutch tables and
+    1100 English ones, the English set being a translated subset. A title is
+    written only in its own table's language, so keywords in one language
+    rarely match tables in the other; pass `language` to search one side
+    cleanly. Note this is a tendency, not a guarantee: descriptions sometimes
+    quote a Dutch source title, so a Dutch word can surface an English table.
+    """
     words = [w for w in terms.strip().lower().split() if w]
     clauses = [
         f"(substringof({odata_literal(w)},tolower(Title)) or "
         f"substringof({odata_literal(w)},tolower(ShortDescription)))"
         for w in words
     ]
+    if language:
+        clauses.append(f"Language eq {odata_literal(language)}")
     data = await _get_json(
         CATALOG,
         {
             "$filter": " and ".join(clauses) or None,
-            "$select": "Identifier,Title,ShortDescription,Period,Frequency,Updated,RecordCount",
+            "$select": (
+                "Identifier,Title,ShortDescription,Period,Frequency,Updated,RecordCount,Language"
+            ),
             "$orderby": "Updated desc",
             "$top": top,
         },
     )
     return data.get("value", [])
+
+
+async def count_tables(language: str | None = None) -> int:
+    """How many tables the catalog holds, optionally in one language."""
+    params = {"$filter": f"Language eq {odata_literal(language)}"} if language else None
+    url = f"{CATALOG}/$count"
+    try:
+        response = await _get_client().get(url, params=params)
+        return int(response.text.strip())
+    except (httpx.HTTPError, ValueError):
+        return 0
 
 
 # -------------------------------------------------------------------- table --
@@ -155,9 +178,7 @@ async def get_codes(
     skip: int,
     search: str | None = None,
 ) -> list[dict[str, Any]]:
-    filt = (
-        f"substringof({odata_literal(search.lower())},tolower(Title))" if search else None
-    )
+    filt = f"substringof({odata_literal(search.lower())},tolower(Title))" if search else None
     data = await _get_json(
         f"{API}/{table_id}/{dimension}",
         {"$filter": filt, "$top": top, "$skip": skip or None},
@@ -170,9 +191,7 @@ async def get_codes(
 
 async def get_code_labels(table_id: str, dimension: str) -> dict[str, str]:
     """code -> label map for one dimension, used to decorate data rows."""
-    data = await _get_json(
-        f"{API}/{table_id}/{dimension}", {"$select": "Key,Title", "$top": 10000}
-    )
+    data = await _get_json(f"{API}/{table_id}/{dimension}", {"$select": "Key,Title", "$top": 10000})
     return {
         (c["Key"] or "").strip(): (c.get("Title") or "").strip()
         for c in data.get("value", [])
