@@ -4,9 +4,9 @@
 
 **Dutch official statistics, queryable by any language model.**
 
-An [MCP](https://modelcontextprotocol.io) server over **CBS StatLine** — the open data
-platform of Statistics Netherlands. It turns a plain question into a real, citable
-statistic: find the right table, read its structure, resolve the codes, return the numbers.
+An [MCP](https://modelcontextprotocol.io) server over CBS StatLine, the open data platform
+of Statistics Netherlands. It turns a plain question into a real, citable statistic: find
+the right table, read its structure, resolve the codes, return the numbers.
 
 [![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.12%20%7C%203.13-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![FastMCP](https://img.shields.io/badge/built%20with-FastMCP%203-0b7285)](https://gofastmcp.com)
@@ -14,7 +14,7 @@ statistic: find the right table, read its structure, resolve the codes, return t
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Data: CC BY 4.0](https://img.shields.io/badge/Data-CC%20BY%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by/4.0/)
 
-**5,956 tables · 4.1 billion observations · Dutch and English · no API key**
+**5,956 tables · 4.1 billion observations · Dutch and English**
 
 </div>
 
@@ -22,26 +22,28 @@ statistic: find the right table, read its structure, resolve the codes, return t
 
 ## Contents
 
-- [What it does](#what-it-does) · [Tools](#tools)
-- [Architecture](#architecture)
-- [How to use it: the two connections](#how-to-use-it-the-two-connections)
-  - [Connection 1 — the Statline MCP server](#connection-1--the-statline-mcp-server)
-  - [Connection 2 — your language model](#connection-2--your-language-model)
-- [A question, end to end](#a-question-end-to-end)
-- [The StatLine data model](#the-statline-data-model)
-- [StatLine architecture](#statline-architecture)
-- [Themes and the taxonomy](#themes-and-the-taxonomy)
-- [Deployment](#deployment) · [Languages and stack](#languages-and-stack) · [Licensing](#licensing)
+1. [What it does](#what-it-does)
+2. [Tools](#tools)
+3. [Architecture](#architecture)
+4. [How to use it: the two connections](#how-to-use-it-the-two-connections)
+5. [A question, end to end](#a-question-end-to-end)
+6. [The StatLine data model](#the-statline-data-model)
+7. [StatLine structure](#statline-structure)
+8. [Themes and the taxonomy](#themes-and-the-taxonomy)
+9. [Deployment](#deployment)
+10. [Languages and stack](#languages-and-stack)
+11. [Configuration](#configuration)
+12. [Licensing](#licensing)
 
 ---
 
 ## What it does
 
-StatLine holds nearly 6,000 statistical tables, but they are addressed by opaque codes —
+StatLine holds nearly 6,000 statistical tables, but they are addressed by opaque codes.
 `83583NED` is a table, `2023JJ00` is the year 2023, `T001098` is a total, `GM0363` is
-Amsterdam. No model can guess these. Statline MCP gives a model a set of typed tools to
-discover tables, look codes up, and query observations, so that every figure it reports is
-traceable to a named table rather than invented.
+Amsterdam. No model can guess these. Statline MCP gives a model typed tools to discover
+tables, look codes up, and query observations, so every figure it reports is traceable to a
+named table rather than invented.
 
 ## Tools
 
@@ -75,198 +77,167 @@ flowchart LR
     end
 
     A <-->|"tool calls"| B
-    B <-->|"MCP<br/>stdio or Streamable HTTP"| C
+    B <-->|"MCP: stdio or Streamable HTTP"| C
     C --> D
-    D <-->|"HTTPS · OData"| E
+    D <-->|"HTTPS: OData"| E
 
     style server fill:#e7f5ff,stroke:#0b7285
     style upstream fill:#fff4e6,stroke:#e8590c
 ```
 
-Two hops, two protocols. Your model talks **MCP** to this server; this server talks
-**OData** to StatLine. Everything is read-only and needs no credentials.
+Two hops and two protocols. Your model speaks **MCP** to this server, and this server speaks
+**OData** to StatLine. Everything is read-only.
 
 ## How to use it: the two connections
 
 Using Statline MCP means wiring up two links. Get both right and any tool-calling model can
 query Dutch statistics.
 
-```mermaid
-flowchart LR
-    LLM["Language model"] -->|"① LLM connection<br/>tool calling"| MCP["MCP client"]
-    MCP -->|"② server connection<br/>stdio or HTTP URL"| SRV["Statline MCP server"]
-    style LLM fill:#f3f0ff,stroke:#5f3dc4
-    style SRV fill:#e7f5ff,stroke:#0b7285
-```
+### Connection 1: the Statline MCP server
 
-### Connection 1 — the Statline MCP server
+Pick one of these. The server is identical in each case, only the transport differs.
 
-Pick **one** of these. The server is the same in each case; only the transport differs.
+1. **Local subprocess (stdio)**, simplest for desktop use:
 
-**Local subprocess (stdio)** — simplest for desktop use:
+   ```bash
+   pip install -r requirements.txt
+   fastmcp run server.py
+   ```
 
-```bash
-pip install -r requirements.txt
-fastmcp run server.py
-```
+2. **Local HTTP**, when a client needs a URL:
 
-**Local HTTP** — when a client needs a URL:
+   ```bash
+   python server.py          # http://localhost:8000/mcp   (override with PORT)
+   ```
 
-```bash
-python server.py          # http://localhost:8000/mcp   (override with PORT)
-```
+3. **Hosted**, a URL anyone on your team can point at:
 
-**Hosted** — a URL anyone on your team can point at:
+   ```
+   https://<your-server>.fastmcp.app/mcp        # FastMCP Cloud
+   https://statline-mcp.<your-cluster>/mcp      # your own Kubernetes
+   ```
 
-```
-https://<your-server>.fastmcp.app/mcp        # FastMCP Cloud
-https://statline-mcp.<your-cluster>/mcp      # your own Kubernetes
-```
+   See [Deployment](#deployment) for both.
 
-See [Deployment](#deployment) for both. Confirm any running server with:
+Confirm any running server with:
 
 ```bash
 python scripts/health_check.py --url http://localhost:8000/mcp
 ```
 
-### Connection 2 — your language model
+### Connection 2: your language model
 
-**Claude Code, local server:**
+1. **Claude Code, local server:**
 
-```bash
-claude mcp add statline -- fastmcp run /absolute/path/to/Statline_MCP/server.py
-```
+   ```bash
+   claude mcp add statline -- fastmcp run /absolute/path/to/Statline_MCP/server.py
+   ```
 
-**Claude Code, hosted server:**
+2. **Claude Code, hosted server:**
 
-```bash
-claude mcp add --transport http statline https://<your-server>.fastmcp.app/mcp
-```
+   ```bash
+   claude mcp add --transport http statline https://<your-server>.fastmcp.app/mcp
+   ```
 
-If the server has authentication enabled it answers `401` until you sign in — run `/mcp`
-inside an interactive Claude Code session and complete the browser flow. For CI or a
-non-interactive agent, pass a token instead:
+   If the server has authentication enabled it answers `401` until you sign in. Run `/mcp`
+   inside an interactive Claude Code session and complete the browser flow. For CI or a
+   non-interactive agent, pass a token instead:
 
-```bash
-claude mcp add --transport http statline https://<your-server>.fastmcp.app/mcp \
-  --header "Authorization: Bearer $TOKEN"
-```
+   ```bash
+   claude mcp add --transport http statline https://<your-server>.fastmcp.app/mcp \
+     --header "Authorization: Bearer $TOKEN"
+   ```
 
-Verify with `claude mcp list` — you want `✔ Connected`.
+   Verify with `claude mcp list`, where you want `✔ Connected`.
 
-**An open-weights model** (Qwen, Llama, Mistral, DeepSeek) behind vLLM, Ollama,
-llama.cpp, TGI or SGLang. An MCP tool's `inputSchema` is already valid JSON Schema, so it
-drops straight into an OpenAI `function.parameters` block:
+3. **An open-weights model** (Qwen, Llama, Mistral, DeepSeek) behind vLLM, Ollama,
+   llama.cpp, TGI or SGLang. An MCP tool's `inputSchema` is already valid JSON Schema, so it
+   drops straight into an OpenAI `function.parameters` block:
 
-```python
-def to_openai_tools(mcp_tools):
-    return [{"type": "function",
-             "function": {"name": t.name,
-                          "description": t.description or "",
-                          "parameters": t.inputSchema}}
-            for t in mcp_tools]
-```
+   ```python
+   def to_openai_tools(mcp_tools):
+       return [{"type": "function",
+                "function": {"name": t.name,
+                             "description": t.description or "",
+                             "parameters": t.inputSchema}}
+               for t in mcp_tools]
+   ```
 
-[`examples/open_llm_client.py`](examples/open_llm_client.py) is a complete working loop:
+   [`examples/open_llm_client.py`](examples/open_llm_client.py) is a complete working loop:
 
-```bash
-# prove the wiring with no model at all
-python examples/open_llm_client.py --dry-run
+   ```bash
+   # prove the wiring with no model at all
+   python examples/open_llm_client.py --dry-run
 
-# a self-hosted model against a deployed server
-python examples/open_llm_client.py \
-  --mcp https://statline-mcp.example.k8s.nl/mcp \
-  --api-base http://localhost:8000/v1 \
-  --model Qwen/Qwen3-32B-Instruct \
-  "How many births were registered in 2023?"
-```
+   # a self-hosted model against a deployed server
+   python examples/open_llm_client.py \
+     --mcp https://statline-mcp.example.k8s.nl/mcp \
+     --api-base http://localhost:8000/v1 \
+     --model Qwen/Qwen3-32B-Instruct \
+     "How many births were registered in 2023?"
+   ```
 
-Four things matter with smaller models:
+4. **Any other MCP client**, such as LangChain, LlamaIndex, Cursor or Continue, connects to
+   the same URL with no bridge at all.
 
-1. **Keep tool descriptions verbatim.** They carry the operational knowledge — codes are
+### Driving it from a smaller model
+
+Four things matter:
+
+1. **Keep tool descriptions verbatim.** They carry the operational knowledge: codes are
    opaque, Dutch has wider coverage, use `browse_themes` when search fails. Truncating them
    to save context is what makes a model start inventing table identifiers.
 2. **Return tool errors as text, not exceptions.** Error messages name the valid dimensions
-   and measures, so a model that guessed wrong can correct itself next turn.
+   and measures, so a model that guessed wrong can correct itself on the next turn.
 3. **Pin a system prompt against fabrication.** Require every figure to come from a tool
-   result, and require the table id to be stated.
-4. **Cap the loop** so a model that never commits cannot spin forever.
-
-Any other MCP client — LangChain, LlamaIndex, Cursor, Continue — connects to the same URL
-with no bridge at all.
+   result, and require the table identifier to be stated.
+4. **Cap the loop** so a model that never commits to an answer cannot spin forever.
 
 ## A question, end to end
 
 > **"How many employee jobs were there in Dutch manufacturing in December 2023?"**
 
-```mermaid
-sequenceDiagram
-    participant M as Model
-    participant S as Statline MCP
-    participant C as StatLine
+1. **Find the table.** The keywords become a catalog query. Every word must appear in a
+   title or description, so three words narrow hard.
 
-    M->>S: search_tables("banen werknemers bedrijfsgrootte", nl)
-    S->>C: catalog query
-    C-->>S: 83583NED
-    S-->>M: table id + coverage
+   ```
+   search_tables(query="banen werknemers bedrijfsgrootte", language="nl")
+     -> 83583NED  Banen van werknemers; bedrijfsgrootte en economische activiteit
+        period 2010-2024 · yearly · 11,160 rows
+   ```
 
-    M->>S: get_table_info("83583NED")
-    S->>C: table metadata (2 requests, concurrent)
-    C-->>S: dimensions + measures
-    S-->>M: Perioden, Bedrijfsgrootte, Bedrijfstakken…
+2. **Read its structure.**
 
-    M->>S: get_dimension_codes(…, "Bedrijfstakken…", search="industrie")
-    S->>C: code list, filtered
-    C-->>S: 307500 = "C Industrie"
-    S-->>M: the code to use
+   ```
+   get_table_info(table_id="83583NED")
+     dimensions: BedrijfstakkenBranchesSBI2008, Bedrijfsgrootte, Perioden
+     measures:   BanenVanWerknemersInDecember_1  [x 1 000]
+   ```
 
-    M->>S: get_data(83583NED, {Perioden:2023JJ00, Bedrijfstakken:307500, …})
-    S->>C: observations + label lookups
-    C-->>S: 793.3
-    S-->>M: labelled table
-```
+3. **Resolve the codes.** "Manufacturing" and "December 2023" are words, but the table wants
+   codes.
 
-**Step 1 — find the table.** The keywords become a catalog query. Each word must appear in
-a title or description, so three words narrow hard:
+   ```
+   get_dimension_codes(table_id="83583NED",
+                       dimension="BedrijfstakkenBranchesSBI2008", search="industrie")
+     -> 307500  "C Industrie"
+   ```
 
-```
-search_tables(query="banen werknemers bedrijfsgrootte", language="nl")
-  -> 83583NED  Banen van werknemers; bedrijfsgrootte en economische activiteit
-     period 2010-2024 · yearly · 11,160 rows
-```
+4. **Query.**
 
-**Step 2 — read its structure.**
+   ```
+   get_data(table_id="83583NED",
+            filters={"Perioden": ["2023JJ00"],
+                     "BedrijfstakkenBranchesSBI2008": ["307500"],
+                     "Bedrijfsgrootte": ["T001098"]})
+   ```
 
-```
-get_table_info(table_id="83583NED")
-  dimensions: BedrijfstakkenBranchesSBI2008, Bedrijfsgrootte, Perioden
-  measures:   BanenVanWerknemersInDecember_1  [x 1 000]
-```
+   | Bedrijfstakken… | …_label | Bedrijfsgrootte | …_label | Perioden | …_label | BanenVanWerknemers… |
+   | --- | --- | --- | --- | --- | --- | --- |
+   | 307500 | C Industrie | T001098 | Totaal | 2023JJ00 | 2023 december | 793.3 |
 
-**Step 3 — resolve the codes.** "Manufacturing" and "December 2023" are words; the table
-wants codes:
-
-```
-get_dimension_codes(table_id="83583NED",
-                    dimension="BedrijfstakkenBranchesSBI2008", search="industrie")
-  -> 307500  "C Industrie"
-```
-
-**Step 4 — query.**
-
-```
-get_data(table_id="83583NED",
-         filters={"Perioden": ["2023JJ00"],
-                  "BedrijfstakkenBranchesSBI2008": ["307500"],
-                  "Bedrijfsgrootte": ["T001098"]})
-```
-
-| Bedrijfstakken… | …_label | Bedrijfsgrootte | …_label | Perioden | …_label | BanenVanWerknemers… |
-| --- | --- | --- | --- | --- | --- | --- |
-| 307500 | C Industrie | T001098 | Totaal | 2023JJ00 | 2023 december | 793.3 |
-
-**The answer:** roughly **793,300 employee jobs** in Dutch manufacturing in December 2023 —
-the measure's unit is *x 1 000* — from table `83583NED`.
+**The answer:** roughly **793,300 employee jobs** in Dutch manufacturing in December 2023,
+since the measure's unit is *x 1 000*, from table `83583NED`.
 
 Each step's output is the next step's input, and codes are always looked up rather than
 guessed. That is the whole design: the model never has to invent an identifier, so its
@@ -293,8 +264,8 @@ One observation carries a code per dimension and a value per measure:
 ```
 
 Columns are typed. Dimensions come as `Dimension`, `TimeDimension` (usually `Perioden`), or
-`GeoDimension` / `GeoDetail` for geography; measures come as `Topic`, each with a `Unit` and
-`Decimals`. `TopicGroup` is only a heading, never a column.
+`GeoDimension` and `GeoDetail` for geography. Measures come as `Topic`, each with a `Unit`
+and `Decimals`. A `TopicGroup` is only a heading, never a column.
 
 **Scale**
 
@@ -303,64 +274,44 @@ Columns are typed. Dimensions come as `Dimension`, `TimeDimension` (usually `Per
 | Tables | 5,956 |
 | Observations across all tables | 4,108,824,238 |
 | Theme nodes | 1,299 |
-| Table ↔ theme links | 8,122 |
+| Table to theme links | 8,122 |
 
-**Two languages.** The catalog is bilingual but lopsided — **4,889 Dutch tables and 1,067
-English**, the English set a translated subset with identifiers ending `ENG`. A table exists
-in one language only: title, dimension names and code labels all follow it. Both discovery
-tools therefore take `language`. Dutch gives far wider coverage; English needs no
-translation.
+**Two languages.** The catalog is bilingual but lopsided: 4,889 Dutch tables and 1,067
+English, the English set being a translated subset with identifiers ending `ENG`. A table
+exists in one language only, and its title, dimension names and code labels all follow it.
+Both discovery tools therefore take `language`. Dutch gives far wider coverage, English
+needs no translation.
 
-## StatLine architecture
+## StatLine structure
 
-StatLine is exposed as OData. There is a catalog describing what exists, and per-table
-endpoints describing and holding each dataset.
-
-```mermaid
-flowchart TD
-    subgraph cat["Catalog — what exists"]
-        T["Tables<br/>5,956 · titles, periods, language"]
-        TH["Themes<br/>1,299 · subject hierarchy"]
-        TT["Tables_Themes<br/>8,122 links"]
-    end
-
-    subgraph tbl["Per table — e.g. 83583NED"]
-        TI["TableInfos<br/>title, period, status"]
-        DP["DataProperties<br/>dimensions + measures"]
-        CL["One code list<br/>per dimension"]
-        DS["TypedDataSet<br/>the observations"]
-    end
-
-    TH --- TT
-    TT --- T
-    T -->|"Identifier"| TI
-    TI --- DP
-    DP -->|"names each"| CL
-    CL -->|"codes filter"| DS
-
-    style cat fill:#e7f5ff,stroke:#0b7285
-    style tbl fill:#f3f0ff,stroke:#5f3dc4
-```
+StatLine is exposed as OData. A catalog describes what exists, and per-table endpoints
+describe and hold each dataset.
 
 | Resource | Contents |
 | --- | --- |
-| `Tables` | Every table with 26 metadata fields |
-| `Themes` / `Tables_Themes` | The subject taxonomy and its links to tables |
+| `Tables` | Every table, with 26 metadata fields |
+| `Themes` | The subject hierarchy, 1,299 nodes |
+| `Tables_Themes` | 8,122 links joining themes to tables |
 | `TableInfos` | Title, period, frequency, language, status, source |
 | `DataProperties` | The table's dimensions and measures |
 | `{DimensionName}` | That dimension's code list |
-| `TypedDataSet` | Observations, numbers typed |
+| `TypedDataSet` | The observations, numbers typed |
 
-Discovery flows top to bottom: the catalog yields an identifier, `DataProperties` names the
+Discovery flows top to bottom. The catalog yields an identifier, `DataProperties` names the
 dimensions, each dimension names its codes, and the codes filter the dataset. The five tools
-map one-to-one onto that path.
+map one to one onto that path:
+
+1. `search_tables` and `browse_themes` query the catalog and the taxonomy.
+2. `get_table_info` reads `TableInfos` and `DataProperties`.
+3. `get_dimension_codes` reads one dimension's code list.
+4. `get_data` filters `TypedDataSet` and joins the code lists back in as labels.
 
 ## Themes and the taxonomy
 
-CBS classifies its tables in the subject hierarchy behind the StatLine website's navigation
-— published as data, so `browse_themes` can walk it.
+CBS classifies its tables in the subject hierarchy behind the StatLine website's navigation,
+published as data so `browse_themes` can walk it.
 
-It is **two parallel trees**, not one translated tree:
+It is two parallel trees, not one translated tree:
 
 | | Theme nodes | Leads to |
 | --- | --- | --- |
@@ -376,9 +327,9 @@ Arbeid en sociale zekerheid > Arbeid en arbeidsmarkt > Banen, vacatures, werkgel
   -> 83583NED, 83582NED, 86205NED, 84826NED, …
 ```
 
-**Tables sit on leaves**, so browsing means descending — a parent theme usually lists
-sub-themes and no tables. 8,122 links across 5,956 tables means many tables are filed under
-several themes.
+Tables sit on leaves, so browsing means descending: a parent theme usually lists sub-themes
+and no tables. 8,122 links across 5,956 tables means many tables are filed under several
+themes.
 
 ### Why two discovery tools
 
@@ -391,18 +342,18 @@ They fail in opposite directions:
 | English reach | ~1,100 of 5,956 tables | full parallel tree |
 | Fails when | your vocabulary is wrong | your term is too specific |
 
-Searching themes for `"Births"` returns nothing — that is a *table* name, not a topic
-(`Population development` is the theme). Conversely an English question can navigate the
-English tree to real data with nothing translated. When one route is empty, the other is
+Searching themes for `"Births"` returns nothing, because that is a *table* name and not a
+topic (`Population development` is the theme). Conversely an English question can navigate
+the English tree to real data with nothing translated. When one route is empty the other is
 the intended recovery, and the server's instructions say so.
 
 ## Deployment
 
 ### FastMCP Cloud
 
-Builds from `requirements.txt`, entrypoint **`server.py:mcp`**, redeploys on every push to
-`main`. Gives you `https://<name>.fastmcp.app/mcp`. Authentication is a per-server toggle —
-turn it off for an open endpoint, or keep it and connect with OAuth as above.
+Builds from `requirements.txt`, entrypoint `server.py:mcp`, redeploys on every push to
+`main`, and gives you `https://<name>.fastmcp.app/mcp`. Authentication is a per-server
+toggle: turn it off for an open endpoint, or keep it and connect with OAuth as above.
 
 ### Docker
 
@@ -411,13 +362,13 @@ docker build -t statline-mcp .
 docker run --rm -p 8000:8000 statline-mcp
 ```
 
-Unprivileged (uid 10001), read-only root filesystem, and a `HEALTHCHECK` that completes a
-real MCP handshake rather than probing the port.
+Runs unprivileged (uid 10001) with a read-only root filesystem, and its `HEALTHCHECK`
+completes a real MCP handshake rather than probing the port.
 
 ### Kubernetes
 
 [`deploy/k8s/`](deploy/k8s) holds a Deployment, Service and Ingress for the
-GitHub → registry → cluster pattern:
+GitHub to registry to cluster pattern:
 
 ```bash
 kubectl kustomize deploy/k8s | kubectl apply -f -
@@ -425,14 +376,15 @@ kubectl kustomize deploy/k8s | kubectl apply -f -
 
 The server lands at `https://<host>/mcp`. Three things worth knowing:
 
-- **Probes hit `/health`, not `/mcp`.** A bare `GET /mcp` is not a valid protocol request,
-  so an `httpGet` probe against it would never pass. `server.py` exposes a plain `200` at
-  `/health` for exactly this.
-- **`/health` does not query upstream** on purpose: a probe reports whether *this process*
-  is serving, and a slow upstream should not restart your pods. Use
-  `scripts/health_check.py` as a `startupProbe` for a deeper gate.
-- **Raise the ingress read timeout.** Streamable HTTP holds responses open; a default 60s
-  cuts long tool calls off mid-stream. The manifest sets 300s and disables proxy buffering.
+1. **Probes hit `/health`, not `/mcp`.** A bare `GET /mcp` is not a valid protocol request,
+   so an `httpGet` probe against it would never pass. `server.py` exposes a plain `200` at
+   `/health` for exactly this.
+2. **`/health` does not query upstream**, on purpose. A probe reports whether *this process*
+   is serving, and a slow upstream should not restart your pods. Use
+   `scripts/health_check.py` as a `startupProbe` for a deeper gate.
+3. **Raise the ingress read timeout.** Streamable HTTP holds responses open, and a default
+   60s cuts long tool calls off mid-stream. The manifest sets 300s and disables proxy
+   buffering.
 
 [`.github/workflows/release.yml`](.github/workflows/release.yml) builds and pushes the image
 to GHCR on every push to `main`, then boots it and probes `/health` before calling the
@@ -463,31 +415,12 @@ Tooling: **ruff** for lint and formatting, **GitHub Actions** for CI, **Docker**
 | Path | Purpose |
 | --- | --- |
 | `server.py` | The five tools and `/health`. Entrypoint `server.py:mcp`. |
-| `cbs.py` | Async StatLine client. No MCP dependency — usable on its own. |
+| `cbs.py` | Async StatLine client, with no MCP dependency, usable on its own. |
 | `smoke.py` | 41-check end-to-end test against the live API. |
 | `scripts/health_check.py` | Probe a running server, shallow or deep. |
 | `examples/open_llm_client.py` | Tool-calling loop for any OpenAI-compatible model. |
-| `Dockerfile` · `deploy/k8s/` | Self-hosting. |
+| `Dockerfile`, `deploy/k8s/` | Self-hosting. |
 | `.github/workflows/` | `test.yml` (lint, smoke, container boot), `release.yml` (image). |
-
-### Configuration
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `PORT` | `8000` | Port for the HTTP transport. |
-| `STATLINE_USER_AGENT` | `statline-mcp/0.3 (+this repo)` | How your traffic identifies itself upstream. |
-| `MCP_STATLINE_URL` | `http://127.0.0.1:8000/mcp` | Default endpoint for the scripts. |
-| `MCP_STATLINE_TOKEN` | — | Bearer token for `health_check.py` against a protected server. |
-
-**If you fork or self-host, set `STATLINE_USER_AGENT`.** Every upstream request carries this
-header so the data provider can see who is calling and has a contact point. Left at the
-default, your deployment's traffic is attributed to this repository rather than to you — and
-any rate limit ever applied to that identifier would follow you with it. Give it your own
-name and a URL or address someone could reach you at:
-
-```bash
-export STATLINE_USER_AGENT="acme-stats/1.0 (+https://acme.example/contact)"
-```
 
 ### Development
 
@@ -496,28 +429,50 @@ python smoke.py                          # end-to-end against the live API
 ruff check . && ruff format --check .    # lint
 ```
 
-CI runs on push, on pull request, and weekly — the weekly run catches upstream changes
-before a user does.
+CI runs on push, on pull request, and weekly. The weekly run catches upstream changes before
+a user does.
+
+## Configuration
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `PORT` | `8000` | Port for the HTTP transport. |
+| `STATLINE_USER_AGENT` | `statline-mcp/0.3 (+this repo)` | How your traffic identifies itself upstream. |
+| `MCP_STATLINE_URL` | `http://127.0.0.1:8000/mcp` | Default endpoint for the scripts. |
+| `MCP_STATLINE_TOKEN` | none | Bearer token for `health_check.py` against a protected server. |
+
+**If you fork or self-host, set `STATLINE_USER_AGENT`.** Every upstream request carries this
+header so the data provider can see who is calling and has a contact point. Left at the
+default, your deployment's traffic is attributed to this repository rather than to you, and
+any rate limit ever applied to that identifier would follow you with it. Give it your own
+name and an address someone could reach you at:
+
+```bash
+export STATLINE_USER_AGENT="acme-stats/1.0 (+https://acme.example/contact)"
+```
 
 ## Licensing
 
-**Code** — [MIT](LICENSE). Use it, fork it, ship it commercially; keep the copyright notice.
+**Code** is [MIT](LICENSE). Use it, fork it, ship it commercially, and keep the copyright
+notice.
 
-**Data** — the statistics this server retrieves are © Statistics Netherlands (CBS) and
-published under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). You may reuse
-them freely, including commercially, provided you **attribute Statistics Netherlands**.
+**Data** retrieved through this server is © Statistics Netherlands (CBS) and published under
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). You may reuse it freely,
+including commercially, provided you **attribute Statistics Netherlands**.
 
 If you publish figures obtained through Statline MCP, credit them like this:
 
 > Source: Statistics Netherlands (CBS), StatLine table `83583NED`, retrieved 2026-08-31.
 > Licensed under CC BY 4.0.
 
-Citing the table identifier and retrieval date matters: StatLine tables are revised, and
-figures are marked provisional or final. The identifier makes any number reproducible.
+Citing the table identifier and the retrieval date matters, because StatLine tables are
+revised and figures are marked provisional or final. The identifier makes any number
+reproducible.
 
-This project is independent and not endorsed by or affiliated with Statistics Netherlands.
+This project is independent, and is not endorsed by or affiliated with Statistics
+Netherlands.
 
 ## Author
 
-Built by [@athithyai](https://github.com/athithyai). Contributions welcome — open an issue
+Built by [@athithyai](https://github.com/athithyai). Contributions welcome, so open an issue
 or a pull request.
