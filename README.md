@@ -13,11 +13,19 @@ to use under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/deed.nl).
 | Tool | What it does |
 | --- | --- |
 | `search_tables` | Search the StatLine catalog by keyword. Titles are in Dutch, so Dutch keywords match best. |
+| `browse_themes` | Walk the CBS subject taxonomy to find tables by topic. Has an **English** tree, so it works where keyword search needs Dutch. |
 | `get_table_info` | Metadata for one table plus its **dimensions** (what you filter on) and **measures** (the numbers). |
 | `get_dimension_codes` | The code list of one dimension, with `search` to narrow large ones like regions. |
 | `get_data` | Filtered observations, with dimension codes resolved to readable labels. |
 
-The intended flow is `search_tables` → `get_table_info` → `get_dimension_codes` → `get_data`.
+The intended flow is `search_tables` *or* `browse_themes` → `get_table_info` →
+`get_dimension_codes` → `get_data`.
+
+Two routes into the catalog, because they fail in different ways: `search_tables` matches
+title text and so needs the right Dutch word, while `browse_themes` navigates a fixed
+topic hierarchy that CBS also publishes in English. Reach for the taxonomy when the
+question is in English or the Dutch term is uncertain, and for keyword search when you
+know what the table is called.
 
 ## Run it locally
 
@@ -81,6 +89,26 @@ get_data           { "table_id": "83583NED",
 | T001081                       | A-U Alle economische activiteiten | 2023JJ00 | 2023 december  | 9020.8                         |
 ```
 
+## Finding tables by topic
+
+CBS files its ~6,000 tables under a subject taxonomy of ~1,300 nodes, published as two
+parallel trees — 1,060 Dutch nodes and 239 English ones — joined to tables by a catalog
+link table. `browse_themes` walks it:
+
+```
+browse_themes()                      -> 46 top-level themes across both trees
+browse_themes(language="en")         -> just the English roots
+browse_themes(search="Population")   -> matching themes, each with its full path
+browse_themes(theme_id=1153)         -> sub-themes and the tables filed here
+```
+
+Tables sit on the leaves, so a parent theme often lists sub-themes and no tables — keep
+descending. The English tree leads to English-language tables (identifiers ending `ENG`),
+the Dutch tree to Dutch ones.
+
+The whole taxonomy arrives in a single request, so it is fetched once and cached for the
+life of the process; paths are computed locally rather than by walking the API.
+
 ## Notes on the data
 
 - **Codes are opaque.** `T001081` is a total, `2023JJ00` is the year 2023, `GM0363` is
@@ -105,7 +133,7 @@ get_data           { "table_id": "83583NED",
 
 | File | Purpose |
 | --- | --- |
-| `server.py` | FastMCP server and the four tools. Entrypoint `server.py:mcp`. |
+| `server.py` | FastMCP server and the five tools. Entrypoint `server.py:mcp`. |
 | `cbs.py` | Async client for the CBS OData feeds. No MCP dependency. |
 | `smoke.py` | End-to-end test of every tool against the live CBS API. |
 

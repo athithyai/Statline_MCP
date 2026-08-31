@@ -10,6 +10,7 @@ dimension's code list.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -262,3 +263,63 @@ async def get_data(
 def statline_url(table_id: str) -> str:
     """Human-facing StatLine page for a table."""
     return f"https://opendata.cbs.nl/statline/#/CBS/nl/dataset/{table_id}/table"
+
+
+# ------------------------------------------------------------------- themes --
+
+# CBS publishes a hierarchical subject taxonomy alongside the table catalog:
+# ~1300 nodes, in both Dutch (`nl`) and English (`en`) trees, joined to tables
+# by Tables_Themes. The whole tree arrives in one request, so it is fetched once
+# and kept for the life of the process - it changes on the order of months.
+_themes_cache: list[dict[str, Any]] | None = None
+_themes_lock = asyncio.Lock()
+
+
+async def get_themes() -> list[dict[str, Any]]:
+    """Every theme node. Cached after the first call."""
+    global _themes_cache
+    async with _themes_lock:
+        if _themes_cache is None:
+            data = await _get_json(f"{CATALOG.rsplit('/', 1)[0]}/Themes")
+            _themes_cache = data.get("value", [])
+    return _themes_cache
+
+
+def theme_path(themes: list[dict[str, Any]], theme_id: int) -> list[dict[str, Any]]:
+    """Root-to-node path, so a model can see where it is in the tree."""
+    by_id = {t["ID"]: t for t in themes}
+    path: list[dict[str, Any]] = []
+    node = by_id.get(theme_id)
+    seen: set[int] = set()
+    while node is not None and node["ID"] not in seen:
+        seen.add(node["ID"])
+        path.append(node)
+        parent = node.get("ParentID")
+        node = by_id.get(parent) if parent is not None else None
+    return list(reversed(path))
+
+
+async def get_theme_tables(theme_id: int) -> list[str]:
+    """Table identifiers filed directly under one theme."""
+    data = await _get_json(
+        f"{CATALOG.rsplit('/', 1)[0]}/Tables_Themes",
+        {"$filter": f"ThemeID eq {int(theme_id)}", "$select": "TableIdentifier"},
+    )
+    return [row["TableIdentifier"] for row in data.get("value", []) if row.get("TableIdentifier")]
+
+
+async def get_tables_by_identifier(identifiers: list[str]) -> list[dict[str, Any]]:
+    """Batch-resolve table identifiers to titles in a single catalog request."""
+    if not identifiers:
+        return []
+    clause = " or ".join(f"Identifier eq {odata_literal(i)}" for i in identifiers)
+    data = await _get_json(
+        CATALOG,
+        {
+            "$filter": clause,
+            "$select": "Identifier,Title,Period,Frequency,Updated,RecordCount",
+        },
+    )
+    rows = {r["Identifier"]: r for r in data.get("value", [])}
+    # Preserve the order the theme listed them in.
+    return [rows[i] for i in identifiers if i in rows]

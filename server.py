@@ -1,7 +1,8 @@
 """mcp-statline - an MCP server over CBS StatLine (Statistics Netherlands).
 
-Exposes four tools:
+Exposes five tools:
     search_tables        find a StatLine table by keyword
+    browse_themes        find a table by topic, via the CBS subject taxonomy
     get_table_info       metadata, dimensions and measures of one table
     get_dimension_codes  the code list of one dimension
     get_data             filtered observations, with code labels resolved
@@ -14,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -30,12 +31,15 @@ mcp = FastMCP(
     version="0.2.0",
     instructions=(
         "Query CBS StatLine, the open data platform of Statistics Netherlands. "
-        "Tables, dimensions and codes are in Dutch. The normal flow is: "
-        "search_tables to find a table id, get_table_info to see its dimensions "
-        "and measures, get_dimension_codes to look up the codes you need, then "
-        "get_data to pull observations. Dimension codes are opaque (T001081 is a "
-        "total, 2023JJ00 is the year 2023, GM0363 is Amsterdam) - always look "
-        "them up rather than guessing."
+        "Most tables, dimensions and codes are in Dutch. The normal flow is: find a "
+        "table id, then get_table_info to see its dimensions and measures, then "
+        "get_dimension_codes to look up the codes you need, then get_data to pull "
+        "observations. To find a table you have two routes: search_tables matches "
+        "keywords against titles, which needs Dutch words; browse_themes walks the CBS "
+        "subject taxonomy, which has an English tree, so prefer it when the question is "
+        "in English or the Dutch term is uncertain. Dimension codes are opaque (T001081 "
+        "is a total, 2023JJ00 is the year 2023, GM0363 is Amsterdam) - always look them "
+        "up rather than guessing."
     ),
 )
 
@@ -372,6 +376,154 @@ async def get_data(
             "has_more": result.has_more,
             "rows": result.rows,
             "source_url": result.url,
+        },
+    )
+
+
+# -------------------------------------------------------------- browse_themes --
+
+
+@mcp.tool(
+    annotations={"readOnlyHint": True, "openWorldHint": True},
+    description=(
+        "Browse the CBS subject taxonomy to find tables by topic instead of by keyword. "
+        "CBS files its ~6000 tables under a hierarchy of themes, published in both a "
+        "Dutch and an English tree - so this works from English topic words where "
+        "search_tables needs Dutch. Call with no arguments for the top-level themes, "
+        "`theme_id` to descend into one and see the tables filed under it, or `search` "
+        "to find a theme by name anywhere in the tree. Tables sit on the leaves, so "
+        "keep descending until they appear."
+    ),
+)
+async def browse_themes(
+    theme_id: Annotated[
+        int | None,
+        Field(description="Descend into this theme: shows its children and its tables."),
+    ] = None,
+    search: Annotated[
+        str | None,
+        Field(description="Find themes whose name contains this text, at any depth."),
+    ] = None,
+    language: Annotated[
+        Literal["nl", "en"] | None,
+        Field(description="Restrict to the Dutch or English tree. Both are shown by default."),
+    ] = None,
+    limit: Annotated[int, Field(description="Maximum themes to list.", ge=1, le=200)] = 60,
+) -> ToolResult:
+    try:
+        themes = await cbs.get_themes()
+    except CbsError as err:
+        raise ToolError(str(err)) from err
+
+    def in_language(node: dict[str, Any]) -> bool:
+        return language is None or node.get("Language") == language
+
+    # --- search: match anywhere in the tree, showing each hit's full path ---
+    if search:
+        needle = search.strip().lower()
+        hits = [
+            t for t in themes if needle in (t.get("Title") or "").lower() and in_language(t)
+        ][:limit]
+        if not hits:
+            return _ok(
+                f'No themes matched "{search}". Try a broader word, or call '
+                f"browse_themes with no arguments to see the top-level themes.",
+                {"search": search, "count": 0, "themes": []},
+            )
+        lines = [
+            f"- `{t['ID']}` [{t['Language']}] "
+            + " > ".join(p["Title"].strip() for p in cbs.theme_path(themes, t["ID"]))
+            for t in hits
+        ]
+        return _ok(
+            f'{len(hits)} theme(s) matching "{search}":\n\n'
+            + "\n".join(lines)
+            + "\n\nNext: browse_themes with one of these theme_id values.",
+            {
+                "search": search,
+                "count": len(hits),
+                "themes": [
+                    {
+                        "id": t["ID"],
+                        "title": t["Title"].strip(),
+                        "language": t["Language"],
+                        "path": [p["Title"].strip() for p in cbs.theme_path(themes, t["ID"])],
+                    }
+                    for t in hits
+                ],
+            },
+        )
+
+    # --- no theme_id: the roots of both trees ---
+    if theme_id is None:
+        roots = [t for t in themes if t.get("ParentID") is None and in_language(t)][:limit]
+        lines = [f"- `{t['ID']}` [{t['Language']}] {t['Title'].strip()}" for t in roots]
+        return _ok(
+            f"{len(roots)} top-level CBS theme(s). The `nl` and `en` trees are separate "
+            f"and lead to Dutch- and English-language tables respectively.\n\n"
+            + "\n".join(lines)
+            + "\n\nNext: browse_themes with a theme_id to descend. Tables appear on the leaves.",
+            {
+                "count": len(roots),
+                "themes": [
+                    {"id": t["ID"], "title": t["Title"].strip(), "language": t["Language"]}
+                    for t in roots
+                ],
+            },
+        )
+
+    # --- descend into one theme ---
+    node = next((t for t in themes if t["ID"] == theme_id), None)
+    if node is None:
+        raise ToolError(
+            f"No theme with id {theme_id}. Call browse_themes with no arguments for the "
+            f"top-level themes, or use `search` to find one by name."
+        )
+
+    children = [t for t in themes if t.get("ParentID") == theme_id][:limit]
+    try:
+        identifiers = await cbs.get_theme_tables(theme_id)
+        tables = await cbs.get_tables_by_identifier(identifiers[:limit])
+    except CbsError as err:
+        raise ToolError(str(err)) from err
+
+    path = cbs.theme_path(themes, theme_id)
+    parts = [
+        "# " + " > ".join(p["Title"].strip() for p in path) + f"  [{node['Language']}]",
+    ]
+    if children:
+        parts.append(
+            f"\n## Sub-themes ({len(children)})\n"
+            + "\n".join(f"- `{c['ID']}` {c['Title'].strip()}" for c in children)
+        )
+    if tables:
+        parts.append(
+            f"\n## Tables ({len(tables)})\n"
+            + "\n".join(
+                f"- **{t['Identifier']}** - {t['Title'].strip()}\n"
+                f"  period: {t.get('Period') or '?'} | rows: {t.get('RecordCount') or '?'} "
+                f"| updated: {(t.get('Updated') or '')[:10]}"
+                for t in tables
+            )
+        )
+    if not children and not tables:
+        parts.append("\n(This theme has no sub-themes and no tables filed directly under it.)")
+    parts.append(
+        "\nNext: "
+        + ("get_table_info with a table identifier." if tables else "browse_themes with a sub-theme id.")
+    )
+
+    return _ok(
+        "\n".join(parts),
+        {
+            "theme": {
+                "id": node["ID"],
+                "title": node["Title"].strip(),
+                "language": node["Language"],
+                "path": [p["Title"].strip() for p in path],
+            },
+            "children": [{"id": c["ID"], "title": c["Title"].strip()} for c in children],
+            "tables": tables,
         },
     )
 

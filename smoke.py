@@ -35,8 +35,16 @@ async def main() -> int:
         names = sorted(t.name for t in tools)
         print("tools:", ", ".join(names))
         check(
-            "four tools registered",
-            names == ["get_data", "get_dimension_codes", "get_table_info", "search_tables"],
+            "five tools registered",
+            names
+            == [
+                "browse_themes",
+                "get_data",
+                "get_dimension_codes",
+                "get_table_info",
+                "search_tables",
+            ],
+            str(names),
         )
 
         async def call(name: str, **args):
@@ -146,6 +154,65 @@ async def main() -> int:
             not result.is_error and "No observations" in text,
             text[:160],
         )
+
+        print("\nbrowse_themes")
+        _, text, data = await call("browse_themes")
+        check("lists root themes", data.get("count", 0) > 40, text[:200])
+        check(
+            "both language trees present",
+            {t["language"] for t in data.get("themes", [])} == {"nl", "en"},
+        )
+
+        _, text, data = await call("browse_themes", language="en")
+        check(
+            "language filter applies",
+            all(t["language"] == "en" for t in data.get("themes", [])),
+            text[:200],
+        )
+
+        _, text, data = await call("browse_themes", search="Population")
+        check("search finds themes", data.get("count", 0) > 0, text[:200])
+        check(
+            "search results carry their path",
+            all(len(t["path"]) >= 1 for t in data.get("themes", [])),
+        )
+
+        _, text, data = await call("browse_themes", theme_id=1153)
+        check("descend lists tables", len(data.get("tables", [])) > 0, text[:200])
+        check("descend reports its path", len(data["theme"]["path"]) >= 2, str(data.get("theme")))
+
+        result, text, _ = await call("browse_themes", theme_id=999999)
+        check("rejects unknown theme id", result.is_error, text[:120])
+
+        # The point of the tool: an English topic must reach real data with no
+        # Dutch involved. Theme titles are coarse topics, so descend to a leaf.
+        _, _, data = await call("browse_themes", search="Population", language="en")
+        english = data.get("themes", [])
+        check("English topic search hits the en tree", bool(english), str(data)[:200])
+
+        ids: list[str] = []
+        frontier = [t["id"] for t in english][:3]
+        for _ in range(4):  # bounded descent
+            if ids or not frontier:
+                break
+            nxt: list[int] = []
+            for tid in frontier[:4]:
+                _, _, themed = await call("browse_themes", theme_id=tid)
+                found = [t["Identifier"] for t in themed.get("tables", [])]
+                if found:
+                    ids = found
+                    break
+                nxt.extend(c["id"] for c in themed.get("children", []))
+            frontier = nxt
+        check("English theme descent reaches tables", bool(ids), f"frontier exhausted")
+
+        if ids:
+            result, text, info = await call("get_table_info", table_id=ids[0])
+            check(
+                f"table {ids[0]} from theme resolves end to end",
+                not result.is_error and len(info.get("dimensions", [])) >= 1,
+                text[:200],
+            )
 
         print("\nvalidation")
         result, text, _ = await call("get_dimension_codes", table_id="83583NED",
