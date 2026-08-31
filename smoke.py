@@ -1,0 +1,161 @@
+"""End-to-end smoke test against the live CBS API.
+
+Connects an in-memory FastMCP client straight to the server object and
+exercises every tool, including paging boundaries and error handling.
+
+    python smoke.py
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+import sys
+
+from fastmcp import Client
+
+import cbs
+from server import mcp
+
+FAILURES: list[str] = []
+
+
+def check(name: str, condition: bool, detail: str = "") -> None:
+    if condition:
+        print(f"  PASS  {name}")
+    else:
+        FAILURES.append(name)
+        print(f"  FAIL  {name} {detail}")
+
+
+async def main() -> int:
+    async with Client(mcp) as client:
+        tools = await client.list_tools()
+        names = sorted(t.name for t in tools)
+        print("tools:", ", ".join(names))
+        check(
+            "four tools registered",
+            names == ["get_data", "get_dimension_codes", "get_table_info", "search_tables"],
+        )
+
+        async def call(name: str, **args):
+            result = await client.call_tool(name, args, raise_on_error=False)
+            text = "\n".join(c.text for c in result.content if hasattr(c, "text"))
+            return result, text, (result.structured_content or {})
+
+        print("\nsearch_tables")
+        _, text, data = await call("search_tables", query="bevolking", limit=3)
+        check("returns tables", data.get("count", 0) > 0, text[:200])
+
+        print("\nget_table_info")
+        _, text, data = await call("get_table_info", table_id="83583NED")
+        check("has dimensions", len(data.get("dimensions", [])) >= 3, text[:200])
+        check("has measures", len(data.get("measures", [])) >= 1)
+        check("lists Perioden", "Perioden" in text)
+
+        print("\nget_dimension_codes")
+        _, text, data = await call(
+            "get_dimension_codes", table_id="83583NED", dimension="Perioden", limit=5
+        )
+        check("returns codes", data.get("count") == 5, text[:200])
+
+        _, text, data = await call(
+            "get_dimension_codes",
+            table_id="83583NED",
+            dimension="Bedrijfsgrootte",
+            search="totaal",
+        )
+        check("search narrows", 0 < data.get("count", 0) < 20, text[:200])
+
+        print("\nget_data")
+        _, text, data = await call(
+            "get_data",
+            table_id="83583NED",
+            filters={"Perioden": ["2023*"], "Bedrijfsgrootte": ["T001098"]},
+            limit=5,
+        )
+        rows = data.get("rows", [])
+        check("returns exactly `limit` rows", data.get("returned") == 5, text[:300])
+        check(
+            "resolves labels",
+            rows and rows[0].get("Bedrijfsgrootte_label") == "Totaal",
+            json.dumps(rows[0] if rows else {}),
+        )
+        check(
+            "label column sits next to its code",
+            bool(re.search(r"\| Perioden \| Perioden_label \|", text)),
+        )
+        check(
+            "codes are trimmed",
+            all(not r["BedrijfstakkenBranchesSBI2008"].endswith(" ") for r in rows),
+        )
+        check("signals more pages", data.get("has_more") is True)
+        print("\n".join(text.splitlines()[:6]))
+
+        # The filter matches 124 rows; a page past the end must terminate.
+        _, text, data = await call(
+            "get_data",
+            table_id="83583NED",
+            filters={"Perioden": ["2023*"], "Bedrijfsgrootte": ["T001098"]},
+            limit=50,
+            offset=100,
+        )
+        check(
+            "last page returns the remainder",
+            data.get("returned") == 24,
+            f"got {data.get('returned')}",
+        )
+        check("last page has_more is false", data.get("has_more") is False)
+
+        _, text, data = await call(
+            "get_data",
+            table_id="83583NED",
+            filters={"Perioden": ["2023JJ00"]},
+            measures=["BanenVanWerknemersInDecember_1"],
+            limit=2,
+            labels=False,
+        )
+        rows = data.get("rows", [])
+        check(
+            "measure select keeps dimensions",
+            rows and rows[0].get("Perioden") == "2023JJ00",
+            text[:200],
+        )
+        check("labels:false omits label columns", "_label" not in text)
+
+        print("\nerror handling")
+        result, text, _ = await call("get_data", table_id="nope", filters={})
+        check("rejects bad table id", result.is_error, text[:120])
+
+        result, text, _ = await call(
+            "get_data", table_id="83583NED", filters={"NotADim": ["x"]}
+        )
+        check("rejects unknown dimension", result.is_error and "dimension" in text, text[:160])
+
+        result, text, _ = await call(
+            "get_data", table_id="83583NED", measures=["Bogus"], limit=1
+        )
+        check("rejects unknown measure", result.is_error, text[:160])
+
+        result, text, data = await call(
+            "get_data", table_id="83583NED", filters={"Perioden": ["1800JJ00"]}
+        )
+        check(
+            "empty result is not an error",
+            not result.is_error and "No observations" in text,
+            text[:160],
+        )
+
+        print("\nvalidation")
+        result, text, _ = await call("get_dimension_codes", table_id="83583NED",
+                                     dimension="Perioden", limit=9999)
+        check("limit bound is enforced", result.is_error, text[:120])
+
+    await cbs.close_client()
+    print("\nALL PASS" if not FAILURES else f"\n{len(FAILURES)} FAILURE(S)")
+    return 0 if not FAILURES else 1
+
+
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()))

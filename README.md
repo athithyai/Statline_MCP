@@ -5,7 +5,8 @@ platform of Statistics Netherlands (Centraal Bureau voor de Statistiek). It lets
 find a StatLine table, inspect its dimensions, look up the codes it needs, and pull
 filtered observations back as a readable table.
 
-No API key. CBS StatLine open data is free to use under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/deed.nl).
+Built with [FastMCP](https://gofastmcp.com). No API key — CBS StatLine open data is free
+to use under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/deed.nl).
 
 ## Tools
 
@@ -18,35 +19,45 @@ No API key. CBS StatLine open data is free to use under [CC BY 4.0](https://crea
 
 The intended flow is `search_tables` → `get_table_info` → `get_dimension_codes` → `get_data`.
 
-## Install
+## Run it locally
 
 ```bash
-git clone https://github.com/athithyai/MCP_statline.git
-cd MCP_statline
-npm install
-npm run build
+pip install -r requirements.txt
+fastmcp run server.py
 ```
 
-## Configure
-
-Claude Code:
+Add it to Claude Code:
 
 ```bash
-claude mcp add statline -- node /absolute/path/to/MCP_statline/dist/index.js
+claude mcp add statline -- fastmcp run /absolute/path/to/MCP_statline/server.py
 ```
 
-Or add it to your MCP client config directly:
+To serve it over HTTP instead of stdio:
 
-```json
-{
-  "mcpServers": {
-    "statline": {
-      "command": "node",
-      "args": ["/absolute/path/to/MCP_statline/dist/index.js"]
-    }
-  }
-}
+```bash
+python server.py
 ```
+
+That listens on `http://localhost:8000/mcp` (override with `PORT`).
+
+## Deploy to FastMCP Cloud
+
+The repo is already shaped for it — [FastMCP Cloud](https://gofastmcp.com/deployment/fastmcp-cloud)
+builds straight from GitHub and installs from `requirements.txt`.
+
+1. Sign in at [fastmcp.cloud](https://fastmcp.cloud) with GitHub and authorise access to
+   this repository (public or private both work).
+2. Create a server pointing at this repo with entrypoint **`server.py:mcp`**.
+3. It deploys in well under a minute and redeploys on every push to `main`.
+
+You get a URL like `https://<your-server-name>.fastmcp.app/mcp`, which connects as:
+
+```bash
+claude mcp add --transport http statline https://<your-server-name>.fastmcp.app/mcp
+```
+
+The `if __name__ == "__main__"` block in `server.py` is ignored by the platform — it only
+exists so the same file runs locally over HTTP.
 
 ## Example
 
@@ -87,18 +98,24 @@ get_data           { "table_id": "83583NED",
   returns the table's *total* row count no matter what `$filter` you pass. There is
   therefore no reliable "N rows match" number; the server fetches one row more than
   requested and reports `has_more` instead.
-- The `ODataApi` endpoint rejects `$skip` outright, so it cannot page. This server uses
+- The `ODataApi` endpoint rejects `$skip` with a 500, so it cannot page. This server uses
   the `ODataFeed` endpoint, which serves the same resources and supports it.
 
-## Development
+## Layout
+
+| File | Purpose |
+| --- | --- |
+| `server.py` | FastMCP server and the four tools. Entrypoint `server.py:mcp`. |
+| `cbs.py` | Async client for the CBS OData feeds. No MCP dependency. |
+| `smoke.py` | End-to-end test of every tool against the live CBS API. |
 
 ```bash
-npm run watch          # recompile on change
-node scripts/smoke.mjs # end-to-end test of all four tools against the live CBS API
+python smoke.py
 ```
 
-The smoke test spawns the built server over stdio and exercises every tool, including
-paging boundaries and error handling. It needs network access.
+The smoke test drives the server through an in-memory FastMCP client and covers paging
+boundaries, label resolution, argument validation and error handling. It needs network
+access.
 
 ## License
 
