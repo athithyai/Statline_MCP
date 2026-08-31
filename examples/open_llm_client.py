@@ -1,4 +1,4 @@
-"""Drive mcp-statline from an open-weights LLM served behind an OpenAI-compatible API.
+"""Drive Statline MCP from an open-weights LLM served behind an OpenAI-compatible API.
 
 Works with anything that speaks /v1/chat/completions and supports tool calling:
 vLLM, Ollama, llama.cpp's server, Text Generation Inference, SGLang.

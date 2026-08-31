@@ -22,7 +22,7 @@ spec:
       containers:
         - name: statline-mcp
           # Replace with your registry path; the repo's Dockerfile builds this.
-          image: ghcr.io/OWNER/statline-mcp:latest
+          image: ghcr.io/athithyai/statline_mcp:latest
           imagePullPolicy: IfNotPresent
           ports:
             - name: http

@@ -1,4 +1,4 @@
-"""mcp-statline - an MCP server over CBS StatLine (Statistics Netherlands).
+"""Statline MCP - an MCP server over CBS StatLine (Statistics Netherlands).
 
 Exposes five tools:
     search_tables        find a StatLine table by keyword
@@ -28,7 +28,7 @@ from starlette.responses import JSONResponse
 import cbs
 from cbs import CbsError
 
-SERVER_NAME = "mcp-statline"
+SERVER_NAME = "statline-mcp"
 SERVER_VERSION = "0.3.0"
 
 mcp = FastMCP(

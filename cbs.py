@@ -11,6 +11,7 @@ dimension's code list.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -23,7 +24,15 @@ CATALOG = "https://opendata.cbs.nl/ODataCatalog/Tables"
 # 500, so it cannot page. ODataFeed serves the same resources and supports it.
 API = "https://opendata.cbs.nl/ODataFeed/odata"
 
-USER_AGENT = "mcp-statline/0.2 (+https://github.com/athithyai/MCP_statline)"
+# Sent on every upstream request so the data provider can see who is calling and
+# has somewhere to reach out if traffic causes trouble. If you run a fork or your
+# own deployment, set STATLINE_USER_AGENT so your traffic is attributed to you
+# rather than to this repository - otherwise your volume shows up under someone
+# else's name, and any rate limit applied to that name would follow.
+USER_AGENT = os.environ.get(
+    "STATLINE_USER_AGENT",
+    "statline-mcp/0.3 (+https://github.com/athithyai/Statline_MCP)",
+)
 TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 
 _TABLE_ID = re.compile(r"^[0-9]{5}[A-Z]{0,4}$")
@@ -208,6 +217,12 @@ def build_data_filter(filters: dict[str, list[str]]) -> str | None:
     Each entry maps a dimension key to one or more codes. A code ending in `*`
     becomes a prefix match, which is how you ask for "all of 2023" on the
     Perioden dimension (`2023*` matches 2023JJ00, 2023KW01, 2023MM01, ...).
+
+    Exact matches compare `trim(dimension)`, not the raw column. Stored codes
+    are padded to a fixed width per dimension ("307500 "), while the code lists
+    return them unpadded, so a plain `eq` against a code taken from
+    get_dimension_codes silently matches nothing whenever the code is shorter
+    than that width. Prefix matches need no trim: the padding is trailing.
     """
     clauses: list[str] = []
     for dimension, raw in filters.items():
@@ -215,9 +230,9 @@ def build_data_filter(filters: dict[str, list[str]]) -> str | None:
         if not values:
             continue
         parts = [
-            f"startswith({dimension},{odata_literal(v[:-1])})"
+            f"startswith({dimension},{odata_literal(v[:-1].strip())})"
             if v.endswith("*")
-            else f"{dimension} eq {odata_literal(v)}"
+            else f"trim({dimension}) eq {odata_literal(v.strip())}"
             for v in values
         ]
         clauses.append(parts[0] if len(parts) == 1 else "(" + " or ".join(parts) + ")")

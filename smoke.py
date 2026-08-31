@@ -172,6 +172,45 @@ async def main() -> int:
         )
         check("labels:false omits label columns", "_label" not in text)
 
+        # Regression: stored codes are padded to a fixed width per dimension
+        # ("307500 "), while get_dimension_codes returns them unpadded. A plain
+        # `eq` matched nothing for any code shorter than that width, which was
+        # most branch and region codes. Filters now compare trim(dimension).
+        _, text, data = await call(
+            "get_data",
+            table_id="83583NED",
+            filters={
+                "Perioden": ["2023JJ00"],
+                "Bedrijfsgrootte": ["T001098"],
+                "BedrijfstakkenBranchesSBI2008": ["307500"],
+            },
+            limit=5,
+        )
+        rows = data.get("rows", [])
+        check("short padded code matches", data.get("returned") == 1, text[:200])
+        check(
+            "padded code resolves its label",
+            rows and rows[0].get("BedrijfstakkenBranchesSBI2008_label") == "C Industrie",
+            str(rows[:1]),
+        )
+
+        # The code as listed and the code as stored must behave identically.
+        _, _, padded = await call(
+            "get_data",
+            table_id="83583NED",
+            filters={
+                "Perioden": ["2023JJ00"],
+                "Bedrijfsgrootte": ["T001098"],
+                "BedrijfstakkenBranchesSBI2008": ["307500 "],
+            },
+            limit=5,
+        )
+        check(
+            "padded and unpadded forms agree",
+            padded.get("returned") == data.get("returned") == 1,
+            f"{padded.get('returned')} vs {data.get('returned')}",
+        )
+
         print("\nerror handling")
         result, text, _ = await call("get_data", table_id="nope", filters={})
         check("rejects bad table id", result.is_error, text[:120])

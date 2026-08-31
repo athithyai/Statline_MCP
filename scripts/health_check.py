@@ -1,4 +1,4 @@
-"""Health check for a running mcp-statline server.
+"""Health check for a running Statline MCP server.
 
 Two levels:
 
