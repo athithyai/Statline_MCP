@@ -28,7 +28,7 @@ the right table, read its structure, resolve the codes, return the numbers.
 4. [How to use it: the two connections](#how-to-use-it-the-two-connections)
 5. [A question, end to end](#a-question-end-to-end)
 6. [The StatLine data model](#the-statline-data-model)
-7. [StatLine structure](#statline-structure)
+7. [StatLine architecture](#statline-architecture)
 8. [Themes and the taxonomy](#themes-and-the-taxonomy)
 9. [Deployment](#deployment)
 10. [Languages and stack](#languages-and-stack)
@@ -60,33 +60,16 @@ self-guiding.
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    subgraph client["Your side"]
-        A["Language model<br/>Claude · Qwen · Llama · Mistral"]
-        B["MCP client<br/>Claude Code · LangChain · custom loop"]
-    end
+Two hops and two protocols:
 
-    subgraph server["Statline MCP"]
-        C["server.py<br/>5 typed tools + /health"]
-        D["cbs.py<br/>async OData client, themes cache"]
-    end
+| Hop | From | To | Protocol |
+| --- | --- | --- | --- |
+| 1 | Your language model, via an MCP client | Statline MCP | MCP, over stdio or Streamable HTTP |
+| 2 | Statline MCP | StatLine open data | HTTPS, OData |
 
-    subgraph upstream["Statistics Netherlands"]
-        E["StatLine open data<br/>5,956 tables"]
-    end
-
-    A <-->|"tool calls"| B
-    B <-->|"MCP: stdio or Streamable HTTP"| C
-    C --> D
-    D <-->|"HTTPS: OData"| E
-
-    style server fill:#e7f5ff,stroke:#0b7285
-    style upstream fill:#fff4e6,stroke:#e8590c
-```
-
-Two hops and two protocols. Your model speaks **MCP** to this server, and this server speaks
-**OData** to StatLine. Everything is read-only.
+`server.py` publishes the five typed tools and a `/health` route. `cbs.py` holds the async
+OData client and the themes cache, and carries no MCP dependency, so it is usable on its
+own. Everything is read-only.
 
 ## How to use it: the two connections
 
@@ -282,10 +265,36 @@ exists in one language only, and its title, dimension names and code labels all 
 Both discovery tools therefore take `language`. Dutch gives far wider coverage, English
 needs no translation.
 
-## StatLine structure
+## StatLine architecture
 
 StatLine is exposed as OData. A catalog describes what exists, and per-table endpoints
 describe and hold each dataset.
+
+```mermaid
+flowchart TD
+    subgraph cat["Catalog: what exists"]
+        T["Tables<br/>5,956 · titles, periods, language"]
+        TH["Themes<br/>1,299 · subject hierarchy"]
+        TT["Tables_Themes<br/>8,122 links"]
+    end
+
+    subgraph tbl["Per table, e.g. 83583NED"]
+        TI["TableInfos<br/>title, period, status"]
+        DP["DataProperties<br/>dimensions + measures"]
+        CL["One code list<br/>per dimension"]
+        DS["TypedDataSet<br/>the observations"]
+    end
+
+    TH --- TT
+    TT --- T
+    T -->|"Identifier"| TI
+    TI --- DP
+    DP -->|"names each"| CL
+    CL -->|"codes filter"| DS
+
+    style cat fill:#e7f5ff,stroke:#0b7285
+    style tbl fill:#f3f0ff,stroke:#5f3dc4
+```
 
 | Resource | Contents |
 | --- | --- |
