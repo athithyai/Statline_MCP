@@ -22,13 +22,18 @@ from fastmcp.exceptions import ToolError
 from fastmcp.tools.tool import ToolResult
 from mcp.types import TextContent
 from pydantic import Field
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 import cbs
 from cbs import CbsError
 
+SERVER_NAME = "mcp-statline"
+SERVER_VERSION = "0.3.0"
+
 mcp = FastMCP(
-    name="mcp-statline",
-    version="0.2.0",
+    name=SERVER_NAME,
+    version=SERVER_VERSION,
     instructions=(
         "Query CBS StatLine, the open data platform of Statistics Netherlands.\n\n"
         "LANGUAGE. The catalog is bilingual but lopsided: ~4900 Dutch tables and ~1100 "
@@ -561,6 +566,23 @@ async def browse_themes(
             "tables": tables,
         },
     )
+
+
+# ---------------------------------------------------------------- health --
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health(_request: Request) -> JSONResponse:
+    """Liveness/readiness probe for load balancers and Kubernetes.
+
+    The MCP endpoint itself is unusable as an HTTP probe: a bare GET /mcp
+    returns 406, since the protocol requires specific Accept headers. Probes
+    need a plain 200, so expose one. This deliberately does not call CBS - a
+    probe reports whether *this* process is serving, and should not take the
+    pod down because an upstream is briefly slow. Use
+    `scripts/health_check.py` for a check that includes the CBS path.
+    """
+    return JSONResponse({"status": "ok", "server": SERVER_NAME, "version": SERVER_VERSION})
 
 
 if __name__ == "__main__":

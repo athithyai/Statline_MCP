@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: statline-mcp
+  labels:
+    app: statline-mcp
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: statline-mcp
+  template:
+    metadata:
+      labels:
+        app: statline-mcp
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: statline-mcp
+          # Replace with your registry path; the repo's Dockerfile builds this.
+          image: ghcr.io/OWNER/statline-mcp:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: PORT
+              value: "8000"
+          # The MCP endpoint cannot serve as an HTTP probe: a bare GET /mcp
+          # returns 406, because the protocol requires specific Accept headers.
+          # server.py exposes /health for exactly this reason.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # /health deliberately does not call CBS, so a slow upstream cannot
+          # restart the pod. To gate rollout on CBS reachability too, add:
+          #   startupProbe:
+          #     exec:
+          #       command: ["python", "scripts/health_check.py"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              # No limit on CPU: this workload is IO-bound on CBS, and a CPU
+              # limit only adds throttling latency.
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: statline-mcp
+  labels:
+    app: statline-mcp
+spec:
+  type: ClusterIP
+  selector:
+    app: statline-mcp
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
