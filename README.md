@@ -449,6 +449,31 @@ a user does.
 | `STATLINE_USER_AGENT` | `statline-mcp/0.3 (+this repo)` | How your traffic identifies itself upstream. |
 | `MCP_STATLINE_URL` | `http://127.0.0.1:8000/mcp` | Default endpoint for the scripts. |
 | `MCP_STATLINE_TOKEN` | none | Bearer token for `health_check.py` against a protected server. |
+| `STATLINE_CA_BUNDLE` | none | CA bundle to validate upstream TLS against. Also reads `SSL_CERT_FILE` and `REQUESTS_CA_BUNDLE`. |
+| `HTTPS_PROXY` / `NO_PROXY` | none | Standard proxy variables, honoured automatically. |
+
+### Behind a corporate proxy
+
+On a network that routes outbound traffic through an intercepting proxy, two
+things are needed. First, point the proxy variables at it while exempting anything
+internal:
+
+```bash
+export HTTPS_PROXY=http://proxy.example:8080
+export NO_PROXY=127.0.0.1,localhost,.internal.example
+```
+
+Second, if that proxy terminates and re-signs TLS, the certificate presented for
+`opendata.cbs.nl` is the proxy's rather than the real one, and the default trust store
+rejects it. Point the server at your organisation's CA bundle:
+
+```bash
+export STATLINE_CA_BUNDLE=/path/to/ca-bundle.crt
+```
+
+Certificate verification is never disabled, only redirected to a different trust anchor.
+Set these in the terminal that runs the server, since that is the process making the
+outbound calls, and restart it afterwards.
 
 **If you fork or self-host, set `STATLINE_USER_AGENT`.** Every upstream request carries this
 header so the data provider can see who is calling and has a contact point. Left at the

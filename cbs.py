@@ -64,13 +64,33 @@ def assert_table_id(table_id: str) -> str:
 _client: httpx.AsyncClient | None = None
 
 
+def _verify() -> str | bool:
+    """What to validate upstream TLS against.
+
+    Behind a proxy that terminates and re-signs TLS, the certificate presented
+    for opendata.cbs.nl is the proxy's, not the real one, so the default trust
+    store rejects it. Point STATLINE_CA_BUNDLE (or the conventional
+    SSL_CERT_FILE / REQUESTS_CA_BUNDLE) at the organisation's CA bundle and
+    verification succeeds against that instead. Verification is never disabled.
+    """
+    for var in ("STATLINE_CA_BUNDLE", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
+        path = os.environ.get(var)
+        if path:
+            return path
+    return True
+
+
 def _get_client() -> httpx.AsyncClient:
     global _client
     if _client is None or _client.is_closed:
+        # trust_env=True (the default) also picks up HTTP_PROXY, HTTPS_PROXY
+        # and NO_PROXY, which is how this reaches the internet on a network
+        # that routes outbound traffic through a proxy.
         _client = httpx.AsyncClient(
             timeout=TIMEOUT,
             headers={"Accept": "application/json", "User-Agent": USER_AGENT},
             follow_redirects=True,
+            verify=_verify(),
         )
     return _client
 
