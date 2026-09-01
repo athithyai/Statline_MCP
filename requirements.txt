@@ -1,2 +1,6 @@
-fastmcp>=3.4.0
+# Pinned below 4.0 deliberately. FastMCP 4.0 restructured the package into a
+# `fastmcp-slim` core, and `fastmcp.tools.tool` no longer resolves, so an
+# unpinned install on a fresh machine breaks at import. Revisit when the 4.x
+# imports have been migrated and tested.
+fastmcp>=3.4,<4
 httpx>=0.27
