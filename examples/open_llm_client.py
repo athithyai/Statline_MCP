@@ -37,6 +37,7 @@ import json
 import os
 import sys
 from typing import Any
+from urllib.parse import urlparse
 
 from fastmcp import Client
 
@@ -45,6 +46,19 @@ DEFAULT_API_BASE = os.environ.get("OPENAI_BASE_URL", "http://localhost:8000/v1")
 DEFAULT_MODEL = os.environ.get("OPEN_LLM_MODEL", "Qwen/Qwen3-32B-Instruct")
 
 MAX_TURNS = 12
+
+
+_LOOPBACK = {"localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]"}
+
+
+def _address(url: str) -> str:
+    """host:port, with every spelling of the loopback address normalised."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if host in _LOOPBACK:
+        host = "localhost"
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    return f"{host}:{port}"
 
 
 def to_openai_tools(mcp_tools: list[Any]) -> list[dict[str, Any]]:
@@ -174,6 +188,19 @@ def main() -> int:
         return asyncio.run(dry_run(args.mcp))
     if not args.question:
         parser.error("give a question, or use --dry-run")
+
+    # Two different services, easily pointed at the same port by accident. The
+    # resulting error comes from deep inside the OpenAI client and says nothing
+    # useful, so catch it here instead. localhost and 127.0.0.1 are the same
+    # address, so compare normalised forms rather than the raw strings.
+    if _address(args.mcp) == _address(args.api_base):
+        parser.error(
+            f"--mcp and --api-base both point at {_address(args.mcp)}. "
+            f"These are different services: --mcp is this StatLine server, "
+            f"--api-base is your LLM. Give the LLM its own host or port "
+            f"(Open WebUI defaults to http://localhost:3000/api)."
+        )
+
     return asyncio.run(run(args.question, args.mcp, args.api_base, args.model, args.api_key))
 
 
