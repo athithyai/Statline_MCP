@@ -25,6 +25,9 @@ publishes typed tools.
         --model Qwen/Qwen3-32B-Instruct \
         "How many births were registered in 2023?"
 
+    # interactive session, history kept between questions
+    python examples/open_llm_client.py --chat --model code_assistant
+
     # no model needed: show the converted schemas and run one tool call
     python examples/open_llm_client.py --dry-run
 """
@@ -96,50 +99,104 @@ async def call_tool(client: Client, name: str, arguments: dict[str, Any]) -> str
     return text or json.dumps(result.structured_content or {})[:4000]
 
 
+SYSTEM_PROMPT = (
+    "You answer questions using CBS StatLine, the open data of Statistics "
+    "Netherlands, through the provided tools. Never invent figures or table "
+    "identifiers - every number must come from a tool result. Codes are "
+    "opaque, so look them up rather than guessing. State which table you "
+    "used, by identifier."
+)
+
+
+def _new_history() -> list[dict[str, Any]]:
+    return [{"role": "system", "content": SYSTEM_PROMPT}]
+
+
+async def _answer(llm, mcp: Client, model: str, tools: list, messages: list) -> str:
+    """Run the tool-calling loop until the model replies without a tool call.
+
+    `messages` is mutated, so the caller keeps the conversation across turns.
+    """
+    for _turn in range(MAX_TURNS):
+        response = await llm.chat.completions.create(
+            model=model, messages=messages, tools=tools, tool_choice="auto"
+        )
+        choice = response.choices[0].message
+        messages.append(choice.model_dump(exclude_none=True))
+
+        if not choice.tool_calls:
+            return choice.content or "(no answer)"
+
+        for tc in choice.tool_calls:
+            args = json.loads(tc.function.arguments or "{}")
+            print(f"  -> {tc.function.name}({json.dumps(args)[:120]})", file=sys.stderr)
+            output = await call_tool(mcp, tc.function.name, args)
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": output[:12000]})
+
+    return f"(gave up after {MAX_TURNS} turns without a final answer)"
+
+
+def _connect(api_base: str, api_key: str):
+    from openai import AsyncOpenAI
+
+    return AsyncOpenAI(base_url=api_base, api_key=api_key)
+
+
 async def run(question: str, mcp_url: str, api_base: str, model: str, api_key: str) -> int:
     try:
-        from openai import AsyncOpenAI
+        llm = _connect(api_base, api_key)
     except ImportError:
         print("pip install openai", file=sys.stderr)
         return 1
 
-    llm = AsyncOpenAI(base_url=api_base, api_key=api_key)
+    async with Client(mcp_url) as mcp:
+        tools = to_openai_tools(await mcp.list_tools())
+        messages = _new_history()
+        messages.append({"role": "user", "content": question})
+        print(await _answer(llm, mcp, model, tools, messages))
+    return 0
+
+
+async def chat(mcp_url: str, api_base: str, model: str, api_key: str) -> int:
+    """Interactive REPL. Keeps the conversation, so follow-up questions work."""
+    try:
+        llm = _connect(api_base, api_key)
+    except ImportError:
+        print("pip install openai", file=sys.stderr)
+        return 1
 
     async with Client(mcp_url) as mcp:
         tools = to_openai_tools(await mcp.list_tools())
-        messages: list[dict[str, Any]] = [
-            {
-                "role": "system",
-                "content": (
-                    "You answer questions using CBS StatLine, the open data of Statistics "
-                    "Netherlands, through the provided tools. Never invent figures or table "
-                    "identifiers - every number must come from a tool result. Codes are "
-                    "opaque, so look them up rather than guessing. State which table you "
-                    "used, by identifier."
-                ),
-            },
-            {"role": "user", "content": question},
-        ]
+        messages = _new_history()
 
-        for _turn in range(MAX_TURNS):
-            response = await llm.chat.completions.create(
-                model=model, messages=messages, tools=tools, tool_choice="auto"
-            )
-            choice = response.choices[0].message
-            messages.append(choice.model_dump(exclude_none=True))
+        print(f"Statline MCP chat - model {model}, {len(tools)} tools")
+        print("Ask in Dutch or English. /reset clears the history, /exit quits.\n")
 
-            if not choice.tool_calls:
-                print(choice.content or "(no answer)")
+        while True:
+            try:
+                # input() blocks, so keep it off the event loop.
+                question = (await asyncio.to_thread(input, "you> ")).strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
                 return 0
 
-            for tc in choice.tool_calls:
-                args = json.loads(tc.function.arguments or "{}")
-                print(f"  -> {tc.function.name}({json.dumps(args)[:120]})", file=sys.stderr)
-                output = await call_tool(mcp, tc.function.name, args)
-                messages.append({"role": "tool", "tool_call_id": tc.id, "content": output[:12000]})
+            if not question:
+                continue
+            if question.lower() in {"/exit", "/quit", "exit", "quit"}:
+                return 0
+            if question.lower() == "/reset":
+                messages = _new_history()
+                print("(history cleared)\n")
+                continue
 
-        print(f"Gave up after {MAX_TURNS} turns without a final answer.", file=sys.stderr)
-        return 1
+            messages.append({"role": "user", "content": question})
+            try:
+                answer = await _answer(llm, mcp, model, tools, messages)
+            except Exception as err:  # noqa: BLE001 - one bad turn must not end the session
+                print(f"error: {type(err).__name__}: {err}\n", file=sys.stderr)
+                messages.pop()
+                continue
+            print(f"\n{answer}\n")
 
 
 async def dry_run(mcp_url: str) -> int:
@@ -182,12 +239,17 @@ def main() -> int:
         action="store_true",
         help="Show converted schemas and run one tool call, without contacting a model.",
     )
+    parser.add_argument(
+        "--chat",
+        action="store_true",
+        help="Interactive session: ask follow-up questions, history is kept.",
+    )
     args = parser.parse_args()
 
     if args.dry_run:
         return asyncio.run(dry_run(args.mcp))
-    if not args.question:
-        parser.error("give a question, or use --dry-run")
+    if not args.question and not args.chat:
+        parser.error("give a question, or use --chat for an interactive session")
 
     # Two different services, easily pointed at the same port by accident. The
     # resulting error comes from deep inside the OpenAI client and says nothing
@@ -201,6 +263,8 @@ def main() -> int:
             f"(Open WebUI defaults to http://localhost:3000/api)."
         )
 
+    if args.chat:
+        return asyncio.run(chat(args.mcp, args.api_base, args.model, args.api_key))
     return asyncio.run(run(args.question, args.mcp, args.api_base, args.model, args.api_key))
 
 

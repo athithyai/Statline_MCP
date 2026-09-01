@@ -152,6 +152,9 @@ python scripts/health_check.py --url http://localhost:8000/mcp
    # prove the wiring with no model at all
    python examples/open_llm_client.py --dry-run
 
+   # interactive session: follow-up questions keep their context
+   python examples/open_llm_client.py --chat --model MODEL-ID
+
    # a self-hosted model against a deployed server
    python examples/open_llm_client.py \
      --mcp https://statline-mcp.example.k8s.nl/mcp \
