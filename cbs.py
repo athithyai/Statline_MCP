@@ -200,6 +200,28 @@ def is_measure(prop: dict[str, Any]) -> bool:
 # ---------------------------------------------------------------- code list --
 
 
+# CBS labels places with their official names, which for several well-known
+# Dutch cities share no substring with the name people actually use: searching
+# "Den Haag", or even "Haag", cannot match "'s-Gravenhage". A caller with no way
+# to guess the official spelling simply gets nothing back, so map the common
+# name onto a fragment of the official one.
+_SEARCH_ALIASES = {
+    "den haag": "gravenhage",
+    "the hague": "gravenhage",
+    "haag": "gravenhage",
+    "den bosch": "hertogenbosch",
+    "s-hertogenbosch": "hertogenbosch",
+    "the netherlands": "nederland",
+    "holland": "nederland",
+}
+
+
+def alias_for(term: str) -> str | None:
+    """A better search fragment for a term CBS spells differently, if any."""
+    key = term.strip().lower().strip("'\"")
+    return _SEARCH_ALIASES.get(key)
+
+
 async def get_codes(
     table_id: str,
     dimension: str,
@@ -207,15 +229,24 @@ async def get_codes(
     skip: int,
     search: str | None = None,
 ) -> list[dict[str, Any]]:
-    filt = f"substringof({odata_literal(search.lower())},tolower(Title))" if search else None
-    data = await _get_json(
-        f"{API}/{table_id}/{dimension}",
-        {"$filter": filt, "$top": top, "$skip": skip or None},
-    )
-    return [
-        {**c, "Key": (c.get("Key") or "").strip(), "Title": (c.get("Title") or "").strip()}
-        for c in data.get("value", [])
-    ]
+    async def fetch(term: str | None) -> list[dict[str, Any]]:
+        filt = f"substringof({odata_literal(term.lower())},tolower(Title))" if term else None
+        data = await _get_json(
+            f"{API}/{table_id}/{dimension}",
+            {"$filter": filt, "$top": top, "$skip": skip or None},
+        )
+        return [
+            {**c, "Key": (c.get("Key") or "").strip(), "Title": (c.get("Title") or "").strip()}
+            for c in data.get("value", [])
+        ]
+
+    rows = await fetch(search)
+    if not rows and search:
+        # Only on a miss, so a term that already works is never second-guessed.
+        alias = alias_for(search)
+        if alias:
+            rows = await fetch(alias)
+    return rows
 
 
 async def get_code_labels(table_id: str, dimension: str) -> dict[str, str]:

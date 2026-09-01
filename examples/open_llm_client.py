@@ -38,6 +38,7 @@ import argparse
 import asyncio
 import json
 import os
+import pathlib
 import sys
 from typing import Any
 from urllib.parse import urlparse
@@ -48,7 +49,7 @@ DEFAULT_MCP = os.environ.get("MCP_STATLINE_URL", "http://127.0.0.1:8000/mcp")
 DEFAULT_API_BASE = os.environ.get("OPENAI_BASE_URL", "http://localhost:8000/v1")
 DEFAULT_MODEL = os.environ.get("OPEN_LLM_MODEL", "Qwen/Qwen3-32B-Instruct")
 
-MAX_TURNS = 12
+MAX_TURNS = int(os.environ.get("OPEN_LLM_MAX_TURNS", "30"))
 
 
 _LOOPBACK = {"localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]"}
@@ -99,25 +100,67 @@ async def call_tool(client: Client, name: str, arguments: dict[str, Any]) -> str
     return text or json.dumps(result.structured_content or {})[:4000]
 
 
-SYSTEM_PROMPT = (
-    "You answer questions using CBS StatLine, the open data of Statistics "
-    "Netherlands, through the provided tools. Never invent figures or table "
-    "identifiers - every number must come from a tool result. Codes are "
-    "opaque, so look them up rather than guessing. State which table you "
-    "used, by identifier."
-)
+# How the model should behave and how the answer should look. Domain knowledge
+# (which tool to reach for, that codes are opaque, Dutch vs English coverage)
+# deliberately lives in the server's tool descriptions instead, so every client
+# gets it. What belongs here is what only this client can decide: grounding
+# rules, search discipline, and answer shape.
+SYSTEM_PROMPT = """You answer questions about Dutch official statistics using CBS StatLine,
+through the provided tools only.
+
+GROUNDING
+- Never invent a figure, table identifier, dimension code, measure name or period code.
+- Use only identifiers and codes that appeared literally in an earlier tool result.
+- If you do not yet know a suitable table, find one with search_tables or browse_themes.
+- Answer only from tool results. If the tools cannot answer, say so plainly.
+
+WORKING METHOD
+- browse_themes narrows by topic; search_tables matches title keywords. If one returns
+  nothing, try the other rather than repeating the same query.
+- Do not run the same search twice. If results are poor, use a shorter or broader term.
+- get_table_info shows a table's dimensions and measures. get_dimension_codes turns a word
+  into the code you need. Call get_data only once the table, codes and measures are known.
+- A tool error is information: read what it says, correct the argument, and try again.
+
+ANSWERING
+- Be compact. No preamble, no restating the question, no closing summary.
+- Report numbers as digits, and apply the measure's unit before answering: a value of 793.3
+  with unit "x 1 000" is 793300.
+- If one value is asked for, give that value.
+- If several values are returned, never drop their labels. Put one per line as
+  "label: value", and for a time series as "period: value".
+- Name the table identifier you used.
+- Reply in the language the question was asked in.
+"""
 
 
-def _new_history() -> list[dict[str, Any]]:
-    return [{"role": "system", "content": SYSTEM_PROMPT}]
+def _new_history(system_prompt: str = SYSTEM_PROMPT) -> list[dict[str, Any]]:
+    return [{"role": "system", "content": system_prompt}]
 
 
-async def _answer(llm, mcp: Client, model: str, tools: list, messages: list) -> str:
+def load_system_prompt(path: str | None) -> str:
+    """Read a custom system prompt, or fall back to the built-in one.
+
+    Answer style is use-case specific: an evaluation harness may want bare
+    values with no prose, a person at a terminal usually wants a sentence. Swap
+    the whole prompt rather than editing the file.
+    """
+    if not path:
+        return SYSTEM_PROMPT
+    text = pathlib.Path(path).read_text(encoding="utf-8").strip()
+    if not text:
+        raise SystemExit(f"system prompt file is empty: {path}")
+    return text
+
+
+async def _answer(
+    llm, mcp: Client, model: str, tools: list, messages: list, max_turns: int = MAX_TURNS
+) -> str:
     """Run the tool-calling loop until the model replies without a tool call.
 
     `messages` is mutated, so the caller keeps the conversation across turns.
     """
-    for _turn in range(MAX_TURNS):
+    for _turn in range(max_turns):
         response = await llm.chat.completions.create(
             model=model, messages=messages, tools=tools, tool_choice="auto"
         )
@@ -133,7 +176,10 @@ async def _answer(llm, mcp: Client, model: str, tools: list, messages: list) -> 
             output = await call_tool(mcp, tc.function.name, args)
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": output[:12000]})
 
-    return f"(gave up after {MAX_TURNS} turns without a final answer)"
+    return (
+        f"(gave up after {max_turns} tool-calling rounds. Raise it with --max-turns, "
+        f"or ask for fewer things at once.)"
+    )
 
 
 def _connect(api_base: str, api_key: str):
@@ -142,7 +188,15 @@ def _connect(api_base: str, api_key: str):
     return AsyncOpenAI(base_url=api_base, api_key=api_key)
 
 
-async def run(question: str, mcp_url: str, api_base: str, model: str, api_key: str) -> int:
+async def run(
+    question: str,
+    mcp_url: str,
+    api_base: str,
+    model: str,
+    api_key: str,
+    system_prompt: str,
+    max_turns: int,
+) -> int:
     try:
         llm = _connect(api_base, api_key)
     except ImportError:
@@ -151,13 +205,20 @@ async def run(question: str, mcp_url: str, api_base: str, model: str, api_key: s
 
     async with Client(mcp_url) as mcp:
         tools = to_openai_tools(await mcp.list_tools())
-        messages = _new_history()
+        messages = _new_history(system_prompt)
         messages.append({"role": "user", "content": question})
-        print(await _answer(llm, mcp, model, tools, messages))
+        print(await _answer(llm, mcp, model, tools, messages, max_turns))
     return 0
 
 
-async def chat(mcp_url: str, api_base: str, model: str, api_key: str) -> int:
+async def chat(
+    mcp_url: str,
+    api_base: str,
+    model: str,
+    api_key: str,
+    system_prompt: str,
+    max_turns: int = MAX_TURNS,
+) -> int:
     """Interactive REPL. Keeps the conversation, so follow-up questions work."""
     try:
         llm = _connect(api_base, api_key)
@@ -167,7 +228,7 @@ async def chat(mcp_url: str, api_base: str, model: str, api_key: str) -> int:
 
     async with Client(mcp_url) as mcp:
         tools = to_openai_tools(await mcp.list_tools())
-        messages = _new_history()
+        messages = _new_history(system_prompt)
 
         print(f"Statline MCP chat - model {model}, {len(tools)} tools")
         print("Ask in Dutch or English. /reset clears the history, /exit quits.\n")
@@ -191,7 +252,7 @@ async def chat(mcp_url: str, api_base: str, model: str, api_key: str) -> int:
 
             messages.append({"role": "user", "content": question})
             try:
-                answer = await _answer(llm, mcp, model, tools, messages)
+                answer = await _answer(llm, mcp, model, tools, messages, max_turns)
             except Exception as err:  # noqa: BLE001 - one bad turn must not end the session
                 print(f"error: {type(err).__name__}: {err}\n", file=sys.stderr)
                 messages.pop()
@@ -240,6 +301,17 @@ def main() -> int:
         help="Show converted schemas and run one tool call, without contacting a model.",
     )
     parser.add_argument(
+        "--max-turns",
+        type=int,
+        default=MAX_TURNS,
+        help=f"Tool-calling rounds before giving up (default {MAX_TURNS}).",
+    )
+    parser.add_argument(
+        "--system-prompt",
+        metavar="FILE",
+        help="Replace the built-in system prompt with the contents of this file.",
+    )
+    parser.add_argument(
         "--chat",
         action="store_true",
         help="Interactive session: ask follow-up questions, history is kept.",
@@ -263,9 +335,22 @@ def main() -> int:
             f"(Open WebUI defaults to http://localhost:3000/api)."
         )
 
+    prompt = load_system_prompt(args.system_prompt)
     if args.chat:
-        return asyncio.run(chat(args.mcp, args.api_base, args.model, args.api_key))
-    return asyncio.run(run(args.question, args.mcp, args.api_base, args.model, args.api_key))
+        return asyncio.run(
+            chat(args.mcp, args.api_base, args.model, args.api_key, prompt, args.max_turns)
+        )
+    return asyncio.run(
+        run(
+            args.question,
+            args.mcp,
+            args.api_base,
+            args.model,
+            args.api_key,
+            prompt,
+            args.max_turns,
+        )
+    )
 
 
 if __name__ == "__main__":

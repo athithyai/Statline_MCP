@@ -116,6 +116,35 @@ async def main() -> int:
         )
         check("search narrows", 0 < data.get("count", 0) < 20, text[:200])
 
+        # CBS labels Den Haag by its official name, "'s-Gravenhage", which shares
+        # no substring with what anyone types - not even "Haag". A model searching
+        # for it got zero hits and could not recover, so common names are aliased
+        # onto the official spelling when the literal search misses.
+        for term in ["Den Haag", "Haag", "The Hague"]:
+            _, text, data = await call(
+                "get_dimension_codes",
+                table_id="85644NED",
+                dimension="RegioS",
+                search=term,
+                limit=10,
+            )
+            hit = [c for c in data.get("codes", []) if c["Key"] == "GM0518"]
+            check(f"'{term}' resolves to 's-Gravenhage", bool(hit), text[:160])
+
+        # An alias must never override a term that already works.
+        _, _, data = await call(
+            "get_dimension_codes",
+            table_id="85644NED",
+            dimension="RegioS",
+            search="Amsterdam",
+            limit=10,
+        )
+        check(
+            "a working search is left alone",
+            any(c["Key"] == "GM0363" for c in data.get("codes", [])),
+            str(data.get("codes", []))[:160],
+        )
+
         print("\nget_data")
         _, text, data = await call(
             "get_data",
