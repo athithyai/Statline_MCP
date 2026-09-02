@@ -14,13 +14,6 @@ the right table, read its structure, resolve the codes, return the numbers.
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Data: CC BY 4.0](https://img.shields.io/badge/Data-CC%20BY%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by/4.0/)
 
-[![Downloads](https://img.shields.io/github/downloads/athithyai/Statline_MCP/total?label=downloads&logo=github)](https://github.com/athithyai/Statline_MCP/releases)
-[![Release](https://img.shields.io/github/v/release/athithyai/Statline_MCP?display_name=tag&sort=semver)](https://github.com/athithyai/Statline_MCP/releases)
-[![Stars](https://img.shields.io/github/stars/athithyai/Statline_MCP?style=flat)](https://github.com/athithyai/Statline_MCP/stargazers)
-[![Forks](https://img.shields.io/github/forks/athithyai/Statline_MCP?style=flat)](https://github.com/athithyai/Statline_MCP/network/members)
-[![Issues](https://img.shields.io/github/issues/athithyai/Statline_MCP)](https://github.com/athithyai/Statline_MCP/issues)
-[![Last commit](https://img.shields.io/github/last-commit/athithyai/Statline_MCP)](https://github.com/athithyai/Statline_MCP/commits/main)
-[![Tests](https://img.shields.io/github/actions/workflow/status/athithyai/Statline_MCP/test.yml?branch=main&label=tests)](https://github.com/athithyai/Statline_MCP/actions/workflows/test.yml)
 
 **5,956 tables · 4.1 billion observations · Dutch and English**
 
