@@ -6,3 +6,8 @@ select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
 # The formatter owns line length; it cannot split long string literals, and
 # several tool descriptions are deliberately long prose.
 ignore = ["E501"]
+
+[lint.per-file-ignores]
+# Tests reach into private helpers on purpose: the cache, the retry policy and
+# the timing registry are internal, and they are exactly what needs covering.
+"tests/*" = ["SLF001"]

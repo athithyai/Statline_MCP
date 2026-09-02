@@ -447,9 +447,20 @@ network conditions, so treat them as indicative. The single warm request is the
 observations themselves, which is the point: everything describing the table is
 cached, and every number is fetched fresh.
 
-Six caches are kept, each with hit and miss counters: table info, data
-properties, code labels, code lists, themes and catalog searches. Two other
-things keep the critical path short:
+Six caches are kept, each with hit, miss and eviction counters: table info, data
+properties, code labels, code lists, themes and catalog searches. Each is an LRU
+bounded at 128 entries as well as by its TTL, so a server asked about many
+tables cannot grow without limit: one large code list is around 60 KB and the
+theme tree is 666 KB, which adds up quickly when nothing is ever released.
+
+Transient upstream failures are retried twice with exponential backoff and
+jitter. Only faults a retry can fix are eligible, so a 404 fails immediately
+rather than making a wrong argument slow as well as wrong, and a `Retry-After`
+header is honoured when one is sent. The jitter matters because `get_data` fans
+out: without it, several failed requests would wake together and hit a
+recovering server as one burst.
+
+Two other things keep the critical path short:
 
 1. `get_data` issues its label lookups **alongside** the observations request
    rather than after it, since labels depend only on dimension names. That takes
@@ -509,6 +520,7 @@ Tooling: **ruff** for lint and formatting, **GitHub Actions** for CI, **Docker**
 | `server.py` | The five tools and `/health`. Entrypoint `server.py:mcp`. |
 | `cbs.py` | Async StatLine client, with no MCP dependency, usable on its own. |
 | `smoke.py` | End-to-end test against the live API, including caching and prompts. |
+| `tests/test_unit.py` | Offline unit tests, no network required. |
 | `scripts/health_check.py` | Probe a running server, shallow or deep. |
 | `scripts/benchmark.py` | Cold vs warm timings, per operation. |
 | `prompts/` | System prompts in Dutch and English. |
@@ -518,9 +530,24 @@ Tooling: **ruff** for lint and formatting, **GitHub Actions** for CI, **Docker**
 
 ### Test coverage
 
-`smoke.py` drives the server through an in-memory client and asserts against the live API.
-It is an end-to-end test rather than a unit test: it verifies real behaviour against real
-data, so it needs network access and will fail if the upstream service is down.
+Two suites, deliberately separated.
+
+**`pytest` runs 57 offline unit tests in about 3 seconds**, with no network at all. They
+cover filter construction and escaping, table-id validation, the cache (TTL expiry, LRU
+eviction, lock pruning, concurrent misses collapsing to one fetch), the retry policy
+(backoff, `Retry-After`, and 404 never being retried), the timing registry and the
+rendering helpers. This is the suite that should gate a merge, because it fails only when
+the code is wrong.
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+**`smoke.py` drives the server through an in-memory client against the live API.** It
+verifies real behaviour against real data, so it needs network access and will fail if the
+upstream service is down or an outbound proxy intercepts TLS. It tells you about the world
+rather than about your change.
 
 ```
 $ python smoke.py
@@ -553,7 +580,9 @@ returned for a filtered query is not the count of matching rows.
 ### Development
 
 ```bash
-python smoke.py                          # end-to-end against the live API
+pytest                                   # 57 offline unit tests, ~3s
+python smoke.py                          # 60 end-to-end checks against the live API
+python scripts/benchmark.py              # cold vs warm timings
 ruff check . && ruff format --check .    # lint
 ```
 
@@ -567,6 +596,9 @@ a user does.
 | `PORT` | `8000` | Port for the HTTP transport. |
 | `STATLINE_CACHE_TTL` | `21600` (6h) | Lifetime of cached metadata. `0` disables caching. |
 | `STATLINE_SEARCH_TTL` | `300` (5m) | Lifetime of cached catalog searches. `0` disables. |
+| `STATLINE_CACHE_MAXSIZE` | `128` | Entries kept per cache before the least recently used is evicted. |
+| `STATLINE_RETRIES` | `2` | Extra attempts after a transient upstream failure. `0` disables. |
+| `STATLINE_RETRY_DELAY` | `0.25` | Base seconds for exponential backoff between retries. |
 | `STATLINE_LOG_LEVEL` | `WARNING` | `INFO` logs every tool call and upstream request; `DEBUG` adds per-function timings. |
 | `STATLINE_USER_AGENT` | `statline-mcp/0.3 (+this repo)` | How your traffic identifies itself upstream. |
 | `MCP_STATLINE_URL` | `http://127.0.0.1:8000/mcp` | Default endpoint for the scripts. |

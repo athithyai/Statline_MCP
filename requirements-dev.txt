@@ -1,0 +1,5 @@
+# Development and CI only. The server itself needs requirements.txt.
+-r requirements.txt
+pytest>=8.0
+pytest-asyncio>=0.24
+ruff==0.9.10

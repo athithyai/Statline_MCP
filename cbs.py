@@ -14,9 +14,11 @@ import asyncio
 import functools
 import logging
 import os
+import random
 import re
 import sys
 import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -175,46 +177,86 @@ CACHE_TTL = float(os.environ.get("STATLINE_CACHE_TTL", "21600"))  # 6 hours; 0 d
 SEARCH_TTL = float(os.environ.get("STATLINE_SEARCH_TTL", "300"))  # 5 minutes; 0 disables
 
 
+# Entries are bounded as well as timed. A long-running server that is asked
+# about many different tables would otherwise hold every code list it ever
+# fetched: a single large one (municipalities) is around 60 KB, and the theme
+# tree is 666 KB, so an unbounded cache grows without limit in exactly the
+# deployment where it matters most.
+CACHE_MAXSIZE = int(os.environ.get("STATLINE_CACHE_MAXSIZE", "128"))
+
+
 class _TTLCache:
-    """Async cache with a time-to-live and one lock per key.
+    """Async LRU cache with a time-to-live and one lock per key.
 
     The per-key lock matters under concurrency: without it, N simultaneous
     requests for a cold key would each issue their own upstream fetch. With it,
     the first fetches and the rest wait on the result.
     """
 
-    def __init__(self, ttl: float) -> None:
+    def __init__(self, ttl: float, maxsize: int = CACHE_MAXSIZE) -> None:
         self.ttl = ttl
-        self._entries: dict[Any, tuple[float, Any]] = {}
+        self.maxsize = max(1, maxsize)
+        self._entries: OrderedDict[Any, tuple[float, Any]] = OrderedDict()
         self._locks: dict[Any, asyncio.Lock] = {}
         self.hits = 0
         self.misses = 0
+        self.evictions = 0
+
+    def _live(self, key: Any) -> tuple[bool, Any]:
+        """Look up a key, honouring the TTL and refreshing its LRU position."""
+        entry = self._entries.get(key)
+        if entry is None:
+            return False, None
+        if time.monotonic() - entry[0] >= self.ttl:
+            # Expired: drop it rather than leaving it to be evicted later.
+            self._discard(key)
+            return False, None
+        self._entries.move_to_end(key)
+        return True, entry[1]
+
+    def _discard(self, key: Any) -> None:
+        self._entries.pop(key, None)
+        # The lock dictionary has to be pruned alongside the entries, or it
+        # becomes the unbounded structure instead.
+        lock = self._locks.get(key)
+        if lock is not None and not lock.locked():
+            self._locks.pop(key, None)
+
+    def _store(self, key: Any, value: Any) -> None:
+        self._entries[key] = (time.monotonic(), value)
+        self._entries.move_to_end(key)
+        while len(self._entries) > self.maxsize:
+            oldest, _ = self._entries.popitem(last=False)
+            self.evictions += 1
+            lock = self._locks.get(oldest)
+            if lock is not None and not lock.locked():
+                self._locks.pop(oldest, None)
 
     async def get_or_fetch(self, key: Any, fetch: Callable[[], Awaitable[Any]]) -> Any:
         if self.ttl <= 0:
             return await fetch()
 
-        entry = self._entries.get(key)
-        if entry is not None and time.monotonic() - entry[0] < self.ttl:
+        found, value = self._live(key)
+        if found:
             self.hits += 1
-            return entry[1]
+            return value
 
         lock = self._locks.setdefault(key, asyncio.Lock())
         async with lock:
             # Re-check: another request may have populated it while we waited.
-            entry = self._entries.get(key)
-            if entry is not None and time.monotonic() - entry[0] < self.ttl:
+            found, value = self._live(key)
+            if found:
                 self.hits += 1
-                return entry[1]
+                return value
             value = await fetch()
-            self._entries[key] = (time.monotonic(), value)
+            self._store(key, value)
             self.misses += 1
             return value
 
     def clear(self) -> None:
         self._entries.clear()
         self._locks.clear()
-        self.hits = self.misses = 0
+        self.hits = self.misses = self.evictions = 0
 
     @property
     def size(self) -> int:
@@ -224,7 +266,7 @@ class _TTLCache:
 _table_info_cache = _TTLCache(CACHE_TTL)
 _properties_cache = _TTLCache(CACHE_TTL)
 _labels_cache = _TTLCache(CACHE_TTL)
-_themes_cache = _TTLCache(CACHE_TTL)
+_themes_cache = _TTLCache(CACHE_TTL, maxsize=2)
 _search_cache = _TTLCache(SEARCH_TTL)
 _codes_cache = _TTLCache(CACHE_TTL)
 
@@ -241,7 +283,14 @@ _ALL_CACHES = {
 def cache_stats() -> dict[str, dict[str, int | float]]:
     """Hit/miss counts per cache, for the health check and for tests."""
     return {
-        name: {"hits": c.hits, "misses": c.misses, "entries": c.size, "ttl": c.ttl}
+        name: {
+            "hits": c.hits,
+            "misses": c.misses,
+            "evictions": c.evictions,
+            "entries": c.size,
+            "maxsize": c.maxsize,
+            "ttl": c.ttl,
+        }
         for name, c in _ALL_CACHES.items()
     }
 
@@ -298,41 +347,110 @@ def _short(url: str) -> str:
     return url.replace("https://opendata.cbs.nl", "")
 
 
+def _backoff(attempt: int) -> float:
+    """Exponential delay with jitter.
+
+    The jitter matters when several requests fail together, which is the normal
+    case here because get_data fans out: without it they would all wake at the
+    same instant and hit the recovering server as one burst.
+    """
+    return RETRY_BASE_DELAY * (2**attempt) * (0.5 + random.random())
+
+
+# A single dropped connection or brief 503 should not surface to the model as a
+# failed answer, so transient faults are retried with exponential backoff.
+# Only faults that a retry can plausibly fix are eligible: a 404 means the table
+# does not exist and will still not exist in a second, and retrying it would
+# just make a wrong argument slow as well as wrong.
+RETRIES = int(os.environ.get("STATLINE_RETRIES", "2"))  # attempts after the first; 0 disables
+RETRY_BASE_DELAY = float(os.environ.get("STATLINE_RETRY_DELAY", "0.25"))
+_RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
+
+
+def _retry_after(response: httpx.Response) -> float | None:
+    """Honour a Retry-After header when the server sends one."""
+    raw = response.headers.get("Retry-After")
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return None  # HTTP-date form; fall back to our own backoff
+
+
 async def _get_json(url: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
     query = {"$format": "json", **{k: v for k, v in (params or {}).items() if v not in (None, "")}}
-    started = time.perf_counter()
-    try:
-        response = await _get_client().get(url, params=query)
-    except httpx.TimeoutException as err:
-        log.warning("upstream timeout %s after %.0fms", _short(url), _ms(started))
-        raise CbsError(f"CBS did not respond within 30s: {url}") from err
-    except httpx.HTTPError as err:
-        log.warning("upstream error %s after %.0fms: %s", _short(url), _ms(started), err)
-        raise CbsError(f"Could not reach CBS: {err}") from err
+    last_error: Exception | None = None
 
-    elapsed = _ms(started)
-    log.info(
-        "upstream %s %s %.0fms %s",
-        response.status_code,
-        _short(url),
-        elapsed,
-        _log_params(query),
+    for attempt in range(RETRIES + 1):
+        started = time.perf_counter()
+        try:
+            response = await _get_client().get(url, params=query)
+        except (httpx.TimeoutException, httpx.TransportError) as err:
+            # Network-level faults are always worth one more try.
+            last_error = err
+            elapsed = _ms(started)
+            _record("upstream", elapsed)
+            if attempt < RETRIES:
+                delay = _backoff(attempt)
+                log.warning(
+                    "upstream %s failed after %.0fms (%s); retry %d/%d in %.2fs",
+                    _short(url),
+                    elapsed,
+                    type(err).__name__,
+                    attempt + 1,
+                    RETRIES,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+            log.warning("upstream %s gave up after %d attempts", _short(url), attempt + 1)
+            if isinstance(err, httpx.TimeoutException):
+                raise CbsError(f"CBS did not respond within 30s: {url}") from err
+            raise CbsError(f"Could not reach CBS: {err}") from err
+
+        elapsed = _ms(started)
+        _record("upstream", elapsed)
+        log.info(
+            "upstream %s %s %.0fms %s",
+            response.status_code,
+            _short(url),
+            elapsed,
+            _log_params(query),
+        )
+
+        if response.status_code in _RETRYABLE_STATUS and attempt < RETRIES:
+            delay = _retry_after(response) or _backoff(attempt)
+            log.warning(
+                "upstream %s returned %s; retry %d/%d in %.2fs",
+                _short(url),
+                response.status_code,
+                attempt + 1,
+                RETRIES,
+                delay,
+            )
+            await asyncio.sleep(delay)
+            continue
+
+        if response.status_code == 404:
+            raise CbsError(
+                f"CBS returned 404 for {response.url}. The table, dimension or measure "
+                f"probably does not exist - check it with get_table_info."
+            )
+        if response.is_error:
+            raise CbsError(
+                f"CBS returned {response.status_code} for {response.url}. {response.text[:400]}"
+            )
+        try:
+            return response.json()
+        except ValueError as err:
+            raise CbsError(f"CBS returned a non-JSON response for {response.url}.") from err
+
+    # Reached only when the final attempt was a retryable status.
+    raise CbsError(
+        f"CBS kept failing for {url} after {RETRIES + 1} attempts."
+        + (f" Last error: {last_error}" if last_error else "")
     )
-    _record("upstream", elapsed)
-
-    if response.status_code == 404:
-        raise CbsError(
-            f"CBS returned 404 for {response.url}. The table, dimension or measure "
-            f"probably does not exist - check it with get_table_info."
-        )
-    if response.is_error:
-        raise CbsError(
-            f"CBS returned {response.status_code} for {response.url}. {response.text[:400]}"
-        )
-    try:
-        return response.json()
-    except ValueError as err:
-        raise CbsError(f"CBS returned a non-JSON response for {response.url}.") from err
 
 
 # ------------------------------------------------------------------ catalog --

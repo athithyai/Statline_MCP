@@ -6,3 +6,7 @@ venv/
 *.egg-info/
 .pytest_cache/
 .DS_Store
+
+# pytest
+.pytest_cache/
+.ruff_cache/

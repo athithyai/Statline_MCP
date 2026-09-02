@@ -26,9 +26,30 @@ jobs:
       - run: ruff check .
       - run: ruff format --check .
 
+  unit:
+    # Offline: no network, so this stays green when the upstream service is
+    # down or an outbound proxy intercepts TLS. It is the job that should gate
+    # a merge; `smoke` tells you about the world, not about the change.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: python -m pytest
+
   smoke:
     runs-on: ubuntu-latest
-    # Hits the live CBS API, which is public but occasionally slow.
+    # Hits the live CBS API, which is public but occasionally slow. A failure
+    # here can mean the upstream changed rather than that this repo broke, so
+    # it does not block the offline `unit` job.
     timeout-minutes: 10
     strategy:
       fail-fast: false
