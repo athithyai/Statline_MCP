@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from typing import Annotated, Any, Literal
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
+from fastmcp.server.middleware import Middleware
 from fastmcp.tools.tool import ToolResult
 from mcp.types import TextContent
 from pydantic import Field
@@ -29,11 +31,39 @@ import cbs
 from cbs import CbsError
 
 SERVER_NAME = "statline-mcp"
-SERVER_VERSION = "0.3.0"
+SERVER_VERSION = "0.4.0"
+
+
+class TimingMiddleware(Middleware):
+    """Record and log how long each tool call takes.
+
+    Timing at this layer measures what the caller actually waits for, including
+    argument validation and label joining, rather than only the upstream
+    requests. Both are recorded, so a slow answer can be attributed either to
+    the network or to this server.
+    """
+
+    async def on_call_tool(self, context, call_next):
+        started = time.perf_counter()
+        name = getattr(context.message, "name", "unknown")
+        try:
+            result = await call_next(context)
+        except Exception:
+            cbs._record(f"tool:{name}", (time.perf_counter() - started) * 1000)
+            cbs.log.warning(
+                "tool %s failed after %.0fms", name, (time.perf_counter() - started) * 1000
+            )
+            raise
+        elapsed = (time.perf_counter() - started) * 1000
+        cbs._record(f"tool:{name}", elapsed)
+        cbs.log.info("tool %s %.0fms", name, elapsed)
+        return result
+
 
 mcp = FastMCP(
     name=SERVER_NAME,
     version=SERVER_VERSION,
+    middleware=[TimingMiddleware()],
     instructions=(
         "Query CBS StatLine, the open data platform of Statistics Netherlands.\n\n"
         "LANGUAGE. The catalog is bilingual but lopsided: ~4900 Dutch tables and ~1100 "
@@ -347,7 +377,11 @@ async def get_data(
         # Selecting measures only would drop the dimensions identifying each row.
         select = [*dim_keys, *measures] if measures else None
 
-        result = await cbs.get_data(
+        # The label lookups depend only on the dimension names, which are
+        # already known, so they do not have to wait for the observations.
+        # Running them alongside the data request takes a whole round trip off
+        # the critical path on a cold cache, and costs nothing on a warm one.
+        data_task = cbs.get_data(
             table_id=tid,
             filters=active,
             dimension_keys=dim_keys,
@@ -355,6 +389,13 @@ async def get_data(
             top=limit,
             skip=offset,
         )
+        if labels:
+            label_task = asyncio.gather(*(cbs.get_code_labels(tid, k) for k in dim_keys))
+            result, label_maps = await asyncio.gather(data_task, label_task)
+            maps_by_dim = dict(zip(dim_keys, label_maps, strict=False))
+        else:
+            result = await data_task
+            maps_by_dim = {}
 
         if not result.rows:
             return _ok(
@@ -371,15 +412,9 @@ async def get_data(
 
         present = [k for k in dim_keys if k in result.rows[0]]
         if labels:
-            maps = dict(
-                zip(
-                    present,
-                    await asyncio.gather(*(cbs.get_code_labels(tid, k) for k in present)),
-                    strict=False,
-                )
-            )
             for row in result.rows:
-                for key, mapping in maps.items():
+                for key in present:
+                    mapping = maps_by_dim.get(key) or {}
                     code = str(row.get(key) or "")
                     row[f"{key}_label"] = mapping.get(code, code)
     except CbsError as err:
@@ -568,6 +603,132 @@ async def browse_themes(
     )
 
 
+# ---------------------------------------------------------------- prompts --
+
+# Dutch-language prompts. StatLine is a Dutch source: most tables, every code
+# label and the wider half of the catalog are in Dutch, and most people asking
+# these questions ask them in Dutch. These are MCP prompts, so any client can
+# surface them as ready-made starting points rather than each user having to
+# work out the search-then-drill-down method themselves.
+#
+# Each one states the method as well as the question, because the failure mode
+# is not a model that cannot call the tools - it is a model that guesses a code
+# instead of looking it up.
+
+_WERKWIJZE = (
+    "Werkwijze:\n"
+    "1. Zoek eerst een geschikte tabel met search_tables (language='nl') of "
+    "browse_themes. Levert de ene niets op, probeer dan de andere.\n"
+    "2. Bekijk de tabel met get_table_info, zodat je de dimensies en de "
+    "meetwaarden kent.\n"
+    "3. Zoek de codes op met get_dimension_codes. Codes zijn betekenisloos van "
+    "zichzelf, dus raad ze nooit.\n"
+    "4. Haal de cijfers op met get_data.\n\n"
+    "Noem de gebruikte tabel bij de identificatie, bijvoorbeeld 83583NED, en "
+    "let op de eenheid van de meetwaarde: bij 'x 1 000' is 793,3 gelijk aan "
+    "793300. Antwoord in het Nederlands."
+)
+
+
+@mcp.prompt(
+    name="statistiek_vraag",
+    title="Statistiekvraag beantwoorden",
+    description=(
+        "Beantwoord een vraag over Nederlandse statistiek met CBS StatLine, "
+        "volgens de vaste werkwijze: eerst de tabel zoeken, dan de codes "
+        "opzoeken, dan pas de cijfers ophalen."
+    ),
+)
+def statistiek_vraag(
+    vraag: Annotated[str, Field(description="De vraag, in het Nederlands.")],
+) -> str:
+    return (
+        f"Beantwoord deze vraag met cijfers uit CBS StatLine.\n\n"
+        f"Vraag: {vraag}\n\n"
+        f"{_WERKWIJZE}\n\n"
+        f"Verzin nooit een cijfer, tabelnummer of code: gebruik alleen wat "
+        f"letterlijk uit een tool is teruggekomen. Kun je het niet vinden, zeg "
+        f"dat dan."
+    )
+
+
+@mcp.prompt(
+    name="tabel_verkennen",
+    title="Tabel verkennen",
+    description=(
+        "Vat samen wat er in een StatLine-tabel zit: welke dimensies, welke "
+        "meetwaarden, welke periode, en welke vragen je ermee kunt beantwoorden."
+    ),
+)
+def tabel_verkennen(
+    tabel_id: Annotated[str, Field(description="Het tabelnummer, bijvoorbeeld 83583NED.")],
+) -> str:
+    return (
+        f"Verken StatLine-tabel {tabel_id}.\n\n"
+        f"Gebruik get_table_info voor de opzet van de tabel, en "
+        f"get_dimension_codes om per dimensie een paar voorbeeldcodes te laten "
+        f"zien. Gebruik get_data alleen voor een enkele voorbeeldrij.\n\n"
+        f"Geef daarna kort weer:\n"
+        f"- waar de tabel over gaat en welke periode hij beslaat;\n"
+        f"- welke dimensies er zijn en waarop je dus kunt filteren;\n"
+        f"- welke meetwaarden er zijn, met hun eenheid;\n"
+        f"- drie vragen die deze tabel goed kan beantwoorden.\n\n"
+        f"Antwoord in het Nederlands."
+    )
+
+
+@mcp.prompt(
+    name="regio_vergelijken",
+    title="Regio's vergelijken",
+    description=(
+        "Vergelijk een onderwerp tussen Nederlandse gemeenten, provincies of "
+        "landsdelen voor een bepaalde periode."
+    ),
+)
+def regio_vergelijken(
+    onderwerp: Annotated[
+        str, Field(description="Wat je wilt vergelijken, bijvoorbeeld 'bevolking'.")
+    ],
+    regios: Annotated[
+        str, Field(description="De regio's, bijvoorbeeld 'Amsterdam, Rotterdam, Utrecht'.")
+    ],
+    periode: Annotated[str, Field(description="De periode, bijvoorbeeld '2023'.")] = "2023",
+) -> str:
+    return (
+        f"Vergelijk {onderwerp} tussen {regios} voor {periode}, met cijfers uit "
+        f"CBS StatLine.\n\n"
+        f"{_WERKWIJZE}\n\n"
+        f"Let op: regio's hebben eigen codes, zoals GM0363 voor Amsterdam. Zoek "
+        f"ze op met get_dimension_codes en gebruik de zoekterm om de juiste "
+        f"gemeente te vinden. Zet het antwoord in een tabel met per regio de "
+        f"naam en de waarde, en noem het gebruikte tabelnummer."
+    )
+
+
+@mcp.prompt(
+    name="tijdreeks",
+    title="Ontwikkeling door de tijd",
+    description=(
+        "Laat zien hoe een onderwerp zich over een reeks jaren heeft ontwikkeld, "
+        "met de cijfers per periode."
+    ),
+)
+def tijdreeks(
+    onderwerp: Annotated[str, Field(description="Het onderwerp, bijvoorbeeld 'werkloosheid'.")],
+    van_jaar: Annotated[str, Field(description="Beginjaar, bijvoorbeeld '2015'.")],
+    tot_jaar: Annotated[str, Field(description="Eindjaar, bijvoorbeeld '2024'.")],
+) -> str:
+    return (
+        f"Laat de ontwikkeling van {onderwerp} zien van {van_jaar} tot en met "
+        f"{tot_jaar}, met cijfers uit CBS StatLine.\n\n"
+        f"{_WERKWIJZE}\n\n"
+        f"Voor jaarcijfers eindigt de periodecode op JJ00, dus 2023 wordt "
+        f"2023JJ00. Wil je alles binnen een jaar, gebruik dan 2023* als filter. "
+        f"Zet het antwoord per periode op een eigen regel als 'periode: waarde', "
+        f"en benoem kort wat de trend is."
+    )
+
+
 # ---------------------------------------------------------------- health --
 
 
@@ -583,6 +744,23 @@ async def health(_request: Request) -> JSONResponse:
     `scripts/health_check.py` for a check that includes the CBS path.
     """
     return JSONResponse({"status": "ok", "server": SERVER_NAME, "version": SERVER_VERSION})
+
+
+@mcp.custom_route("/metrics", methods=["GET"])
+async def metrics(_request: Request) -> JSONResponse:
+    """Per-operation timings and cache effectiveness.
+
+    Separate from /health so probes stay trivial. Answers "which call is slow"
+    and "is the cache working" on a running deployment, without redeploying.
+    """
+    return JSONResponse(
+        {
+            "server": SERVER_NAME,
+            "version": SERVER_VERSION,
+            "timings_ms": cbs.timings(),
+            "caches": cbs.cache_stats(),
+        }
+    )
 
 
 if __name__ == "__main__":

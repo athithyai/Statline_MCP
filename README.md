@@ -31,9 +31,10 @@ the right table, read its structure, resolve the codes, return the numbers.
 7. [StatLine architecture](#statline-architecture)
 8. [Themes and the taxonomy](#themes-and-the-taxonomy)
 9. [Deployment](#deployment)
-10. [Languages and stack](#languages-and-stack)
-11. [Configuration](#configuration)
-12. [Licensing](#licensing)
+10. [Performance](#performance)
+11. [Languages and stack](#languages-and-stack)
+12. [Configuration](#configuration)
+13. [Licensing](#licensing)
 
 ---
 
@@ -58,6 +59,29 @@ named table rather than invented.
 Every response ends with a `Next:` line naming the tool to call next, so the chain is
 self-guiding.
 
+### Dutch prompts
+
+StatLine is a Dutch source: every code label, and the wider half of the catalog, is in
+Dutch. The server therefore ships MCP prompts in Dutch, which a client can offer as
+ready-made starting points:
+
+| Prompt | Doel |
+| --- | --- |
+| `statistiek_vraag(vraag)` | Beantwoord een vraag volgens de vaste werkwijze. |
+| `tabel_verkennen(tabel_id)` | Vat samen wat er in een tabel zit. |
+| `regio_vergelijken(onderwerp, regios, periode)` | Vergelijk gemeenten of provincies. |
+| `tijdreeks(onderwerp, van_jaar, tot_jaar)` | Toon de ontwikkeling door de tijd. |
+
+Each one states the method as well as the question, because the failure mode is not a
+model that cannot call the tools, but one that guesses a code instead of looking it up.
+
+For the open-LLM client, `prompts/system_nl.md` and `prompts/system_en.md` are complete
+system prompts in either language:
+
+```bash
+python examples/open_llm_client.py --system-prompt prompts/system_nl.md --chat
+```
+
 ## Architecture
 
 Two hops and two protocols:
@@ -67,9 +91,10 @@ Two hops and two protocols:
 | 1 | Your language model, via an MCP client | Statline MCP | MCP, over stdio or Streamable HTTP |
 | 2 | Statline MCP | StatLine open data | HTTPS, OData |
 
-`server.py` publishes the five typed tools and a `/health` route. `cbs.py` holds the async
-OData client and the themes cache, and carries no MCP dependency, so it is usable on its
-own. Everything is read-only.
+`server.py` publishes the five typed tools, the Dutch prompts, and the `/health` and
+`/metrics` routes. `cbs.py` holds the async OData client, the caches and the timing
+instrumentation, and carries no MCP dependency, so it is usable on its own. Everything is
+read-only.
 
 ## How to use it: the two connections
 
@@ -402,6 +427,60 @@ The server lands at `https://<host>/mcp`. Three things worth knowing:
 to GHCR on every push to `main`, then boots it and probes `/health` before calling the
 release good.
 
+## Performance
+
+Metadata is cached, observations never are. A table's shape changes when the
+table is revised, so a few hours of staleness is invisible; a figure is the
+volatile part, and a stale figure is a wrong answer.
+
+Measured with `scripts/benchmark.py` on one realistic four-call question:
+
+| | Upstream requests | Wall clock |
+| --- | --- | --- |
+| Cold cache | 8 | ~1200 ms |
+| Same chain, warm | 1 | ~35 ms |
+| Follow-up question, same table | 1 | ~30 ms |
+
+The request counts are exact and reproducible; the wall-clock figures move with
+network conditions, so treat them as indicative. The single warm request is the
+observations themselves, which is the point: everything describing the table is
+cached, and every number is fetched fresh.
+
+Six caches are kept, each with hit and miss counters: table info, data
+properties, code labels, code lists, themes and catalog searches. Two other
+things keep the critical path short:
+
+1. `get_data` issues its label lookups **alongside** the observations request
+   rather than after it, since labels depend only on dimension names. That takes
+   a full round trip off a cold call.
+2. One HTTP connection pool is shared for the process, so repeat calls skip TLS
+   setup. On a cold start that handshake is the single largest cost.
+
+### Seeing where time goes
+
+```bash
+python scripts/benchmark.py                  # cold vs warm, with a timing table
+python scripts/benchmark.py --url <mcp-url>  # against a deployment
+```
+
+A running server also reports live figures at `/metrics`:
+
+```json
+{ "timings_ms": { "tool:get_data": { "count": 3, "mean_ms": 33.8, "max_ms": 43.9 },
+                  "upstream":      { "count": 12, "mean_ms": 49.7 } },
+  "caches":     { "data_properties": { "hits": 4, "misses": 1, "entries": 1 } } }
+```
+
+Timings come in two families: `tool:<name>` is what the caller waits for,
+including validation and label joining, while a bare `<name>` is the client
+function beneath it and `upstream` is a single HTTP request. A large gap between
+`tool:get_data` and `upstream` means the time is being spent in this server
+rather than the network.
+
+Set `STATLINE_LOG_LEVEL=INFO` to log every tool call and upstream request with
+its duration. Logs go to stderr, never stdout, because under the stdio transport
+stdout carries the MCP protocol itself.
+
 ## Languages and stack
 
 | Language | Lines | Used for |
@@ -428,8 +507,10 @@ Tooling: **ruff** for lint and formatting, **GitHub Actions** for CI, **Docker**
 | --- | --- |
 | `server.py` | The five tools and `/health`. Entrypoint `server.py:mcp`. |
 | `cbs.py` | Async StatLine client, with no MCP dependency, usable on its own. |
-| `smoke.py` | 41-check end-to-end test against the live API. |
+| `smoke.py` | End-to-end test against the live API, including caching and prompts. |
 | `scripts/health_check.py` | Probe a running server, shallow or deep. |
+| `scripts/benchmark.py` | Cold vs warm timings, per operation. |
+| `prompts/` | System prompts in Dutch and English. |
 | `examples/open_llm_client.py` | Tool-calling loop for any OpenAI-compatible model. |
 | `Dockerfile`, `deploy/k8s/` | Self-hosting. |
 | `.github/workflows/` | `test.yml` (lint, smoke, container boot), `release.yml` (image). |
@@ -449,6 +530,9 @@ a user does.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `PORT` | `8000` | Port for the HTTP transport. |
+| `STATLINE_CACHE_TTL` | `21600` (6h) | Lifetime of cached metadata. `0` disables caching. |
+| `STATLINE_SEARCH_TTL` | `300` (5m) | Lifetime of cached catalog searches. `0` disables. |
+| `STATLINE_LOG_LEVEL` | `WARNING` | `INFO` logs every tool call and upstream request; `DEBUG` adds per-function timings. |
 | `STATLINE_USER_AGENT` | `statline-mcp/0.3 (+this repo)` | How your traffic identifies itself upstream. |
 | `MCP_STATLINE_URL` | `http://127.0.0.1:8000/mcp` | Default endpoint for the scripts. |
 | `MCP_STATLINE_TOKEN` | none | Bearer token for `health_check.py` against a protected server. |

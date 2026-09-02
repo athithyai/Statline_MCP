@@ -20,6 +20,24 @@ from server import mcp
 
 FAILURES: list[str] = []
 
+# One realistic question, reused by the caching checks.
+CHAIN = [
+    ("search_tables", {"query": "banen werknemers bedrijfsgrootte", "language": "nl", "limit": 3}),
+    ("get_table_info", {"table_id": "83583NED"}),
+    (
+        "get_dimension_codes",
+        {"table_id": "83583NED", "dimension": "Bedrijfsgrootte", "search": "totaal"},
+    ),
+    (
+        "get_data",
+        {
+            "table_id": "83583NED",
+            "filters": {"Perioden": ["2023JJ00"], "Bedrijfsgrootte": ["T001098"]},
+            "limit": 5,
+        },
+    ),
+]
+
 
 def check(name: str, condition: bool, detail: str = "") -> None:
     if condition:
@@ -323,6 +341,111 @@ async def main() -> int:
             "get_dimension_codes", table_id="83583NED", dimension="Perioden", limit=9999
         )
         check("limit bound is enforced", result.is_error, text[:120])
+
+        print("\ncaching")
+        # Count upstream requests directly: wall-clock is network-dependent and
+        # would make this test flaky, but the request count is deterministic.
+        original = cbs._get_json
+        requests: list[str] = []
+
+        async def counting(url, params=None):
+            requests.append(url)
+            return await original(url, params)
+
+        cbs._get_json = counting
+        try:
+            cbs.clear_caches()
+            requests.clear()
+            for name, args in CHAIN:
+                await call(name, **args)
+            cold = len(requests)
+
+            requests.clear()
+            for name, args in CHAIN:
+                await call(name, **args)
+            warm = len(requests)
+            warm_urls = list(requests)
+
+            requests.clear()
+            await call(
+                "get_data",
+                table_id="83583NED",
+                filters={"Perioden": ["2022JJ00"], "Bedrijfsgrootte": ["T001098"]},
+                limit=2,
+            )
+            follow_up = len(requests)
+        finally:
+            cbs._get_json = original
+
+        print(f"  cold={cold} warm={warm} follow-up={follow_up} upstream requests")
+        check("warm run makes fewer requests than cold", warm < cold, f"{warm} vs {cold}")
+        # Exactly one, and it must be the observations: all metadata is cached,
+        # while figures are always fetched fresh. Anything else would mean
+        # either a metadata miss or, worse, a stale number.
+        check("warm repeat costs exactly one request", warm == 1, f"{warm} requests")
+        check(
+            "the one warm request is the dataset, not metadata",
+            warm_urls and warm_urls[0].endswith("TypedDataSet"),
+            str(warm_urls),
+        )
+        check(
+            "follow-up query costs one request",
+            follow_up == 1,
+            f"{follow_up} requests",
+        )
+
+        stats = cbs.cache_stats()
+        check("every cache is registered", len(stats) == 6, str(list(stats)))
+        check(
+            "caches recorded hits",
+            sum(s["hits"] for s in stats.values()) > 0,
+            str({k: v["hits"] for k, v in stats.items()}),
+        )
+
+        # Observations must never be served stale.
+        check(
+            "observations are not cached",
+            follow_up == 1,
+            "a different period must still reach upstream",
+        )
+
+        print("\ntimings")
+        t = cbs.timings()
+        check(
+            "per-tool timings recorded", any(k.startswith("tool:") for k in t), str(list(t))[:200]
+        )
+        check("client-function timings recorded", "get_data" in t, str(list(t))[:200])
+        check("upstream timings recorded", "upstream" in t, str(list(t))[:200])
+
+        print("\ndutch prompts")
+        prompts = await client.list_prompts()
+        names = sorted(p.name for p in prompts)
+        check(
+            "four dutch prompts registered",
+            names == ["regio_vergelijken", "statistiek_vraag", "tabel_verkennen", "tijdreeks"],
+            str(names),
+        )
+
+        rendered = await client.get_prompt(
+            "statistiek_vraag", {"vraag": "Hoeveel inwoners heeft Nederland?"}
+        )
+        body = rendered.messages[0].content.text
+        check("prompt embeds the question", "Hoeveel inwoners heeft Nederland?" in body)
+        check("prompt is in dutch", "Werkwijze" in body and "tabel" in body.lower(), body[:120])
+        check(
+            "prompt names the tools to use",
+            all(t in body for t in ("search_tables", "get_dimension_codes", "get_data")),
+            body[:200],
+        )
+
+        series = await client.get_prompt(
+            "tijdreeks", {"onderwerp": "werkloosheid", "van_jaar": "2015", "tot_jaar": "2024"}
+        )
+        check(
+            "tijdreeks explains the period code format",
+            "JJ00" in series.messages[0].content.text,
+            series.messages[0].content.text[:150],
+        )
 
     await cbs.close_client()
     print("\nALL PASS" if not FAILURES else f"\n{len(FAILURES)} FAILURE(S)")
