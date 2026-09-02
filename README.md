@@ -14,6 +14,14 @@ the right table, read its structure, resolve the codes, return the numbers.
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Data: CC BY 4.0](https://img.shields.io/badge/Data-CC%20BY%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by/4.0/)
 
+[![Downloads](https://img.shields.io/github/downloads/athithyai/Statline_MCP/total?label=downloads&logo=github)](https://github.com/athithyai/Statline_MCP/releases)
+[![Release](https://img.shields.io/github/v/release/athithyai/Statline_MCP?display_name=tag&sort=semver)](https://github.com/athithyai/Statline_MCP/releases)
+[![Stars](https://img.shields.io/github/stars/athithyai/Statline_MCP?style=flat)](https://github.com/athithyai/Statline_MCP/stargazers)
+[![Forks](https://img.shields.io/github/forks/athithyai/Statline_MCP?style=flat)](https://github.com/athithyai/Statline_MCP/network/members)
+[![Issues](https://img.shields.io/github/issues/athithyai/Statline_MCP)](https://github.com/athithyai/Statline_MCP/issues)
+[![Last commit](https://img.shields.io/github/last-commit/athithyai/Statline_MCP)](https://github.com/athithyai/Statline_MCP/commits/main)
+[![Tests](https://img.shields.io/github/actions/workflow/status/athithyai/Statline_MCP/test.yml?branch=main&label=tests)](https://github.com/athithyai/Statline_MCP/actions/workflows/test.yml)
+
 **5,956 tables · 4.1 billion observations · Dutch and English**
 
 </div>
@@ -514,6 +522,40 @@ Tooling: **ruff** for lint and formatting, **GitHub Actions** for CI, **Docker**
 | `examples/open_llm_client.py` | Tool-calling loop for any OpenAI-compatible model. |
 | `Dockerfile`, `deploy/k8s/` | Self-hosting. |
 | `.github/workflows/` | `test.yml` (lint, smoke, container boot), `release.yml` (image). |
+
+### Test coverage
+
+`smoke.py` drives the server through an in-memory client and asserts against the live API.
+It is an end-to-end test rather than a unit test: it verifies real behaviour against real
+data, so it needs network access and will fail if the upstream service is down.
+
+```
+$ python smoke.py
+tools: browse_themes, get_data, get_dimension_codes, get_table_info, search_tables
+...
+ALL PASS
+```
+
+**60 checks across 11 areas:**
+
+| Area | Checks | What is asserted |
+| --- | --- | --- |
+| `search_tables` | 7 | Dutch and English filtering, `ENG` identifiers, cross-language containment, empty-result guidance |
+| `browse_themes` | 11 | Both language trees, paths, descent to tables, an English topic reaching real data |
+| `get_data` | 12 | Paging boundaries, label placement, code trimming, measure selection, padded-code matching |
+| `get_dimension_codes` | 6 | Narrowing, and place-name aliases resolving to official spellings |
+| `get_table_info` | 3 | Dimensions, measures, time dimension present |
+| Caching | 7 | Warm run costs one request, and that request is the dataset, never metadata |
+| Dutch prompts | 5 | All four registered, rendered in Dutch, naming the tools and the period format |
+| Error handling | 4 | Bad table, unknown dimension, unknown measure, empty result is not an error |
+| Timings | 3 | Per-tool, per-function and upstream timings all recorded |
+| Validation | 1 | Argument bounds enforced |
+| Registration | 1 | Exactly five tools exposed |
+
+Several of these exist because they caught real bugs: codes are stored space-padded, so an
+exact-match filter silently returned nothing for short codes; `$skip` is unsupported on one
+of the two upstream endpoints, so paging broke past the first page; and the row count
+returned for a filtered query is not the count of matching rows.
 
 ### Development
 
