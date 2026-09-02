@@ -2,7 +2,7 @@
 
 # Statline MCP
 
-**Unofficial MCP server made for Dutch official statistics, queryable by any language model.**
+**MCP server made for Dutch official statistics, queryable by any language model.**
 
 An [MCP](https://modelcontextprotocol.io) server over CBS StatLine, the open data platform
 of Statistics Netherlands. It turns a plain question into a real, citable statistic: find
