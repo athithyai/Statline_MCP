@@ -17,7 +17,7 @@ metadata:
 spec:
   ingressClassName: nginx
   rules:
-    # e.g. statline-mcp.example.k8s.local
+    # Replace with the hostname your cluster serves this on.
     - host: statline-mcp.example.k8s.local
       http:
         paths:
