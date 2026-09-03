@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from contextlib import asynccontextmanager
 from typing import Annotated, Any, Literal
 
 from fastmcp import FastMCP
@@ -60,10 +61,40 @@ class TimingMiddleware(Middleware):
         return result
 
 
+# Building the catalog index costs one 6 MB request, about a second. Doing it
+# at startup rather than on first use means no user ever waits for it. It runs
+# in the background so the server starts serving immediately, and a failure is
+# logged rather than raised: the index is an optimisation, and search falls back
+# to server-side filtering without it.
+PREWARM = os.environ.get("STATLINE_PREWARM", "1") not in ("0", "false", "no")
+
+
+@asynccontextmanager
+async def lifespan(_server: FastMCP):
+    task = None
+    if PREWARM:
+
+        async def warm() -> None:
+            try:
+                index = await cbs.get_catalog_index()
+                cbs.log.info("catalog index ready: %d tables", len(index))
+            except Exception as err:  # noqa: BLE001 - never block startup
+                cbs.log.warning("catalog prewarm failed, will build on demand: %s", err)
+
+        task = asyncio.create_task(warm())
+    try:
+        yield
+    finally:
+        if task and not task.done():
+            task.cancel()
+        await cbs.close_client()
+
+
 mcp = FastMCP(
     name=SERVER_NAME,
     version=SERVER_VERSION,
     middleware=[TimingMiddleware()],
+    lifespan=lifespan,
     instructions=(
         "Query CBS StatLine, the open data platform of Statistics Netherlands.\n\n"
         "LANGUAGE. The catalog is bilingual but lopsided: ~4900 Dutch tables and ~1100 "
@@ -126,14 +157,16 @@ def _as_table(rows: list[dict[str, Any]], columns: list[str]) -> str:
     annotations={"readOnlyHint": True, "openWorldHint": True},
     description=(
         "Search the CBS StatLine catalog for tables by keyword and return their "
-        "identifiers. The catalog is bilingual: ~4900 Dutch tables and ~1100 English "
-        "ones (a translated subset, identifiers ending ENG). A title is written only in "
-        "its table's own language, so keywords in one language rarely match tables in "
-        "the other - set `language` to search one side cleanly. Dutch gives far wider "
-        "coverage "
-        "(bevolking, werkloosheid, inkomen, bedrijven, criminaliteit, energie); English "
-        "covers less but needs no translation. All words must match. If a keyword search "
-        "comes up empty, try browse_themes instead."
+        "identifiers, best match first. Results are ranked, not filtered: a table that "
+        "matches most of your words still appears, and the response says so when nothing "
+        "matched all of them. Word stems count, so 'bevolking' finds "
+        "'Bevolkingsontwikkeling'. The catalog is bilingual: ~4900 Dutch tables and ~1100 "
+        "English ones (a translated subset, identifiers ending ENG). A title is written "
+        "only in its table's own language, so set `language` to match the language of "
+        "your keywords. Dutch gives far wider coverage (bevolking, werkloosheid, inkomen, "
+        "bedrijven, criminaliteit, energie); English covers less but needs no "
+        "translation. Two or three specific words work better than a long phrase. If a "
+        "search still comes up empty, try browse_themes instead."
     ),
 )
 async def search_tables(
@@ -155,10 +188,11 @@ async def search_tables(
     limit: Annotated[int, Field(description="Maximum tables to return.", ge=1, le=50)] = 10,
 ) -> ToolResult:
     try:
-        rows = await cbs.search_tables(query, limit, language)
+        found = await cbs.search_tables(query, limit, language)
     except CbsError as err:
         raise ToolError(str(err)) from err
 
+    rows = found.rows
     if not rows:
         hint = (
             "the English catalog is a translated subset, so try language='nl' with a Dutch keyword"
@@ -181,13 +215,31 @@ async def search_tables(
         f"  {_truncate(r.get('ShortDescription'), 220)}"
         for r in rows
     ]
+    # Say plainly when nothing matched every word. Otherwise a model reads the
+    # best of a weak set as though it were an exact hit.
+    if found.ranked and not found.matched_all and found.total_terms > 1:
+        quality = (
+            f"\n\nNo table matched all {found.total_terms} words. These match "
+            f"{found.matched_terms} of them, best first. Consider a shorter query, or "
+            f"browse_themes to navigate by topic."
+        )
+    else:
+        quality = ""
+
     return _ok(
         f'{len(rows)} table(s) matching "{query}"'
         + (f" in {language}" if language else "")
-        + ":\n\n"
+        + ", best first:\n\n"
         + "\n\n".join(blocks)
+        + quality
         + "\n\nNext: get_table_info with one of these identifiers.",
-        {"query": query, "language": language, "count": len(rows), "tables": rows},
+        {
+            "query": query,
+            "language": language,
+            "count": len(rows),
+            "matched_all_terms": found.matched_all,
+            "tables": rows,
+        },
     )
 
 

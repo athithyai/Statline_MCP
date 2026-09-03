@@ -453,6 +453,157 @@ def test_cache_ttl_of_zero_is_respected_as_a_setting():
     assert cbs._TTLCache(ttl=0).ttl == 0
 
 
+# --------------------------------------------------------------- ranking --
+
+
+def _index(*titles: str, language: str = "nl", **extra) -> list[dict]:
+    return [
+        cbs._prepare(
+            {
+                "Identifier": f"{80000 + i}NED",
+                "Title": title,
+                "ShortTitle": "",
+                "ShortDescription": "",
+                "Language": language,
+                "Updated": "2020-01-01",
+                "RecordCount": 100,
+                **extra,
+            }
+        )
+        for i, title in enumerate(titles)
+    ]
+
+
+def test_exact_title_word_outranks_a_substring():
+    index = _index("Bevolking naar leeftijd", "Iets over onderbevolkingsdruk elders")
+    rows, _ = cbs.rank_tables(index, "bevolking", None, 10)
+    assert rows[0]["Title"] == "Bevolking naar leeftijd"
+
+
+def test_dutch_compound_is_found_by_its_stem():
+    # The whole point: "bevolking" must reach "Bevolkingsontwikkeling", which
+    # literal AND matching on separate words never would.
+    index = _index("Bevolkingsontwikkeling per regio")
+    rows, matched = cbs.rank_tables(index, "bevolking", None, 10)
+    assert len(rows) == 1 and matched == 1
+
+
+def test_covering_more_terms_wins():
+    index = _index("Banen van werknemers naar bedrijfsgrootte", "Banen in de zorg")
+    rows, matched = cbs.rank_tables(index, "banen werknemers bedrijfsgrootte", None, 10)
+    assert rows[0]["Title"].startswith("Banen van werknemers")
+    assert matched == 3
+
+
+def test_partial_matches_still_returned_and_flagged():
+    # Strict AND would return nothing here; ranking returns the best partial
+    # and reports how many words it actually matched.
+    index = _index("Werkloosheid naar leeftijd")
+    rows, matched = cbs.rank_tables(index, "werkloosheid jongeren", None, 10)
+    assert len(rows) == 1
+    assert matched == 1  # only one of the two words
+
+
+def test_nothing_matching_returns_nothing():
+    index = _index("Bevolking naar leeftijd")
+    rows, matched = cbs.rank_tables(index, "zzzznotarealword", None, 10)
+    assert rows == [] and matched == 0
+
+
+def test_language_filter_excludes_the_other_tree():
+    index = _index("Population by age", language="en") + _index("Bevolking naar leeftijd")
+    rows, _ = cbs.rank_tables(index, "population", "nl", 10)
+    assert rows == []
+    rows, _ = cbs.rank_tables(index, "population", "en", 10)
+    assert len(rows) == 1
+
+
+def test_phrase_in_order_is_boosted():
+    index = _index("Banen van werknemers", "Werknemers en banen apart genoemd")
+    rows, _ = cbs.rank_tables(index, "banen werknemers", None, 10)
+    assert rows[0]["Title"] == "Banen van werknemers"
+
+
+def test_limit_is_respected():
+    index = _index(*[f"Bevolking tabel {i}" for i in range(20)])
+    rows, _ = cbs.rank_tables(index, "bevolking", None, 5)
+    assert len(rows) == 5
+
+
+def test_ranking_strips_internal_fields():
+    index = _index("Bevolking naar leeftijd")
+    rows, _ = cbs.rank_tables(index, "bevolking", None, 10)
+    assert not any(k.startswith("_") for k in rows[0])
+
+
+def test_recent_tables_edge_out_stale_ones():
+    old = _index("Bevolking cijfers", Updated="2015-01-01")
+    new = _index("Bevolking cijfers", Updated="2025-01-01")
+    rows, _ = cbs.rank_tables(old + new, "bevolking", None, 10)
+    assert rows[0]["Updated"].startswith("2025")
+
+
+def test_empty_query_matches_nothing():
+    index = _index("Bevolking naar leeftijd")
+    rows, matched = cbs.rank_tables(index, "   ", None, 10)
+    assert rows == [] and matched == 0
+
+
+def test_description_match_is_weakest():
+    titled = cbs._prepare(
+        {
+            "Identifier": "1NED",
+            "Title": "Energie verbruik",
+            "ShortTitle": "",
+            "ShortDescription": "",
+            "Language": "nl",
+            "Updated": "2020",
+            "RecordCount": 1,
+        }
+    )
+    described = cbs._prepare(
+        {
+            "Identifier": "2NED",
+            "Title": "Iets anders",
+            "ShortTitle": "",
+            "ShortDescription": "gaat over energie",
+            "Language": "nl",
+            "Updated": "2020",
+            "RecordCount": 1,
+        }
+    )
+    rows, _ = cbs.rank_tables([described, titled], "energie", None, 10)
+    assert rows[0]["Identifier"] == "1NED"
+
+
+def test_search_result_reports_full_versus_partial():
+    full = cbs.SearchResult(rows=[{}], matched_terms=2, total_terms=2)
+    partial = cbs.SearchResult(rows=[{}], matched_terms=1, total_terms=2)
+    assert full.matched_all is True
+    assert partial.matched_all is False
+
+
+def test_search_result_with_no_query_is_not_a_full_match():
+    assert cbs.SearchResult().matched_all is False
+
+
+def test_tokens_lowercases_and_drops_punctuation():
+    assert cbs._tokens("Banen, werknemers; 2023!") == ["banen", "werknemers", "2023"]
+
+
+def test_prepare_caps_the_description():
+    row = cbs._prepare(
+        {
+            "Identifier": "1NED",
+            "Title": "T",
+            "ShortTitle": "",
+            "Language": "nl",
+            "ShortDescription": "x" * 1000,
+        }
+    )
+    assert len(row["ShortDescription"]) == cbs.DESCRIPTION_CAP
+
+
 # ------------------------------------------------------- data result shape --
 
 

@@ -395,7 +395,7 @@ async def main() -> int:
         )
 
         stats = cbs.cache_stats()
-        check("every cache is registered", len(stats) == 6, str(list(stats)))
+        check("every cache is registered", len(stats) == 7, str(list(stats)))
         check(
             "caches recorded hits",
             sum(s["hits"] for s in stats.values()) > 0,

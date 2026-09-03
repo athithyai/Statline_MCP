@@ -51,7 +51,7 @@ named table rather than invented.
 
 | Tool | Purpose |
 | --- | --- |
-| `search_tables` | Find tables by keyword, in Dutch or English (`language`). |
+| `search_tables` | Find tables by keyword, ranked best-first, in Dutch or English (`language`). |
 | `browse_themes` | Find tables by topic through the subject taxonomy. Full English tree. |
 | `get_table_info` | A table's dimensions (what you filter on) and measures (the numbers). |
 | `get_dimension_codes` | The valid codes of one dimension, with `search` to narrow big ones. |
@@ -59,6 +59,36 @@ named table rather than invented.
 
 Every response ends with a `Next:` line naming the tool to call next, so the chain is
 self-guiding.
+
+### Search is ranked, not filtered
+
+The upstream catalog filter is literal substring matching joined with AND, so every word
+has to appear verbatim or you get nothing at all. `"bevolking groei"` returns **zero**
+tables that way, while 337 contain one of the two words. Dutch makes this worse: the word
+you want is often glued inside a longer compound, so someone searching `bevolking` should
+still find *Bevolkingsontwikkeling*.
+
+So this server holds the catalog (5,956 rows, about 6 MB) and scores against it instead:
+
+| Signal | Weight |
+| --- | --- |
+| Exact word in the title | 10 |
+| Stem or compound match in the title | 6 |
+| Substring of the title | 4 |
+| In the short title | 2 |
+| In the description | 1 |
+| Whole query, in order, in the title | +15 |
+
+Covering more of the query beats scoring highly on one word, so the coverage fraction is
+squared into the score. Recency and table size act only as tie-breakers. When nothing
+matches every word the results still come back, ordered, with the response saying so
+plainly, rather than a model reading the best of a weak set as though it were exact.
+
+```
+search_tables("bevolking groei")
+  -> 70870NED  Prognose bevolking; intervallen bevolkingsontwikkeling
+     03759ned  Bevolking op 1 januari en gemiddeld; geslacht, leeftijd en regio
+```
 
 ### Dutch prompts
 
@@ -441,6 +471,8 @@ Measured with `scripts/benchmark.py` on one realistic four-call question:
 | Cold cache | 8 | ~1200 ms |
 | Same chain, warm | 1 | ~35 ms |
 | Follow-up question, same table | 1 | ~30 ms |
+| Search, index prewarmed | 0 | ~10 ms |
+| Search, repeat of the same query | 0 | ~0 ms |
 
 The request counts are exact and reproducible; the wall-clock figures move with
 network conditions, so treat them as indicative. The single warm request is the
@@ -459,6 +491,15 @@ rather than making a wrong argument slow as well as wrong, and a `Retry-After`
 header is honoured when one is sent. The jitter matters because `get_data` fans
 out: without it, several failed requests would wake together and hit a
 recovering server as one burst.
+
+The catalog index is built once at startup in the background, so nobody waits for it:
+building it on demand would make the first search cost about 1.3 seconds, while a
+prewarmed server answers in roughly 35 ms. Prewarming never blocks startup and never
+fails a request, since search falls back to server-side filtering without an index. Set
+`STATLINE_PREWARM=0` for short-lived processes that will only ask one question.
+
+Ranking itself costs about 24 ms across all 5,956 rows, which is well under the network
+round trip it replaces.
 
 Two other things keep the critical path short:
 
@@ -532,11 +573,12 @@ Tooling: **ruff** for lint and formatting, **GitHub Actions** for CI, **Docker**
 
 Two suites, deliberately separated.
 
-**`pytest` runs 57 offline unit tests in about 3 seconds**, with no network at all. They
-cover filter construction and escaping, table-id validation, the cache (TTL expiry, LRU
-eviction, lock pruning, concurrent misses collapsing to one fetch), the retry policy
-(backoff, `Retry-After`, and 404 never being retried), the timing registry and the
-rendering helpers. This is the suite that should gate a merge, because it fails only when
+**`pytest` runs 73 offline unit tests in about 2 seconds**, with no network at all. They
+cover filter construction and escaping, table-id validation, search ranking (compounds,
+coverage, phrase boosts, language isolation), the cache (TTL expiry, LRU eviction, lock
+pruning, concurrent misses collapsing to one fetch), the retry policy (backoff,
+`Retry-After`, and 404 never being retried), the timing registry and the rendering
+helpers. This is the suite that should gate a merge, because it fails only when
 the code is wrong.
 
 ```bash
@@ -571,6 +613,8 @@ ALL PASS
 | Timings | 3 | Per-tool, per-function and upstream timings all recorded |
 | Validation | 1 | Argument bounds enforced |
 | Registration | 1 | Exactly five tools exposed |
+| Caching (unit) | 8 | LRU eviction, TTL expiry, lock pruning, concurrent-miss collapsing |
+| Ranking (unit) | 16 | Compound matching, coverage, phrases, language isolation |
 
 Several of these exist because they caught real bugs: codes are stored space-padded, so an
 exact-match filter silently returned nothing for short codes; `$skip` is unsupported on one
@@ -580,7 +624,7 @@ returned for a filtered query is not the count of matching rows.
 ### Development
 
 ```bash
-pytest                                   # 57 offline unit tests, ~3s
+pytest                                   # 73 offline unit tests, ~2s
 python smoke.py                          # 60 end-to-end checks against the live API
 python scripts/benchmark.py              # cold vs warm timings
 ruff check . && ruff format --check .    # lint
@@ -599,6 +643,7 @@ a user does.
 | `STATLINE_CACHE_MAXSIZE` | `128` | Entries kept per cache before the least recently used is evicted. |
 | `STATLINE_RETRIES` | `2` | Extra attempts after a transient upstream failure. `0` disables. |
 | `STATLINE_RETRY_DELAY` | `0.25` | Base seconds for exponential backoff between retries. |
+| `STATLINE_PREWARM` | `1` | Build the catalog index at startup. `0` builds it on first search. |
 | `STATLINE_LOG_LEVEL` | `WARNING` | `INFO` logs every tool call and upstream request; `DEBUG` adds per-function timings. |
 | `STATLINE_USER_AGENT` | `statline-mcp/0.3 (+this repo)` | How your traffic identifies itself upstream. |
 | `MCP_STATLINE_URL` | `http://127.0.0.1:8000/mcp` | Default endpoint for the scripts. |

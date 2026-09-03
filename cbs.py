@@ -269,6 +269,8 @@ _labels_cache = _TTLCache(CACHE_TTL)
 _themes_cache = _TTLCache(CACHE_TTL, maxsize=2)
 _search_cache = _TTLCache(SEARCH_TTL)
 _codes_cache = _TTLCache(CACHE_TTL)
+# One entry per language filter; the whole catalog, so it needs no LRU room.
+_catalog_cache = _TTLCache(SEARCH_TTL, maxsize=2)
 
 _ALL_CACHES = {
     "table_info": _table_info_cache,
@@ -277,6 +279,7 @@ _ALL_CACHES = {
     "themes": _themes_cache,
     "search": _search_cache,
     "codes": _codes_cache,
+    "catalog": _catalog_cache,
 }
 
 
@@ -453,11 +456,172 @@ async def _get_json(url: str, params: dict[str, Any] | None = None) -> dict[str,
     )
 
 
+# ------------------------------------------------------------ catalog index --
+
+# Why rank locally instead of letting the API filter.
+#
+# The upstream filter is literal substring matching joined with AND, so every
+# word must appear verbatim or you get nothing at all. "bevolking groei"
+# returns zero tables that way, while 337 contain one of the two words. Worse,
+# Dutch compounds mean the word you want is often glued inside a longer one:
+# someone searching "bevolking" should find "Bevolkingsontwikkeling".
+#
+# The whole catalog is 5,956 rows and about 6 MB once descriptions are capped,
+# and it arrives in a single request. Holding it lets us score and rank instead
+# of filter, which turns a brittle exact match into an ordered best-effort list.
+CATALOG_FIELDS = (
+    "Identifier,Title,ShortTitle,ShortDescription,Period,Frequency,Updated,RecordCount,Language"
+)
+DESCRIPTION_CAP = 200
+
+_word = re.compile(r"[a-z0-9]+")
+
+
+def _tokens(text: str) -> list[str]:
+    return _word.findall(text.lower())
+
+
+def _prepare(row: dict[str, Any]) -> dict[str, Any]:
+    """Precompute the lowercase forms used for scoring, once per row."""
+    title = (row.get("Title") or "").strip()
+    short = (row.get("ShortTitle") or "").strip()
+    desc = (row.get("ShortDescription") or "")[:DESCRIPTION_CAP]
+    return {
+        **row,
+        "Title": title,
+        "ShortDescription": desc,
+        "_title": title.lower(),
+        "_title_words": set(_tokens(title)),
+        "_short": short.lower(),
+        "_desc": desc.lower(),
+    }
+
+
+@timed("get_catalog_index")
+async def get_catalog_index() -> list[dict[str, Any]]:
+    """The whole table catalog, prepared for scoring. Cached for SEARCH_TTL."""
+
+    async def fetch() -> list[dict[str, Any]]:
+        data = await _get_json(CATALOG, {"$select": CATALOG_FIELDS})
+        return [_prepare(r) for r in data.get("value", [])]
+
+    return await _catalog_cache.get_or_fetch("all", fetch)
+
+
+# Weights, highest first. A word in the title is the strongest signal we have;
+# a word buried in a description is the weakest and is mostly there to rescue
+# searches that would otherwise return nothing.
+_W_TITLE_WORD = 10.0  # exact word in the title
+_W_TITLE_STEM = 6.0  # compound or inflection: bevolking <-> bevolkingsontwikkeling
+_W_TITLE_SUB = 4.0  # appears somewhere in the title
+_W_SHORT = 2.0  # in the short title
+_W_DESC = 1.0  # in the description
+_W_PHRASE = 15.0  # the whole query, in order, in the title
+
+
+def score_row(row: dict[str, Any], terms: list[str], phrase: str) -> tuple[float, int]:
+    """Score one table against the query. Returns (score, terms matched).
+
+    Pure and side-effect free, so it can be tested without touching a network.
+    """
+    if not terms:
+        return 0.0, 0
+
+    total = 0.0
+    matched = 0
+    title_words = row["_title_words"]
+
+    for term in terms:
+        if term in title_words:
+            hit = _W_TITLE_WORD
+        elif any(w.startswith(term) or term.startswith(w) for w in title_words):
+            hit = _W_TITLE_STEM
+        elif term in row["_title"]:
+            hit = _W_TITLE_SUB
+        elif term in row["_short"]:
+            hit = _W_SHORT
+        elif term in row["_desc"]:
+            hit = _W_DESC
+        else:
+            hit = 0.0
+        if hit:
+            matched += 1
+            total += hit
+
+    if not matched:
+        return 0.0, 0
+
+    # Covering every word matters more than scoring highly on one of them:
+    # squaring the coverage keeps a full match ahead of a strong partial one.
+    coverage = matched / len(terms)
+    total *= coverage**2
+
+    if len(terms) > 1 and phrase and phrase in row["_title"]:
+        total += _W_PHRASE
+
+    # Gentle tie-breakers. A table that is still being updated, and one with
+    # more observations, is usually the one a person means.
+    updated = row.get("Updated") or ""
+    if updated >= "2024":
+        total += 1.0
+    if (row.get("RecordCount") or 0) > 10000:
+        total += 0.5
+
+    return total, matched
+
+
+def rank_tables(
+    index: list[dict[str, Any]],
+    query: str,
+    language: str | None,
+    limit: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Rank the catalog against a query.
+
+    Returns the best rows and how many query words the best row matched, so the
+    caller can tell the difference between a confident hit and a partial one.
+    """
+    terms = _tokens(query)
+    phrase = " ".join(terms)
+    scored: list[tuple[float, int, dict[str, Any]]] = []
+
+    for row in index:
+        if language and row.get("Language") != language:
+            continue
+        score, matched = score_row(row, terms, phrase)
+        if score > 0:
+            scored.append((score, matched, row))
+
+    scored.sort(key=lambda s: (-s[0], s[2].get("Identifier", "")))
+    best_matched = scored[0][1] if scored else 0
+    rows = [{k: v for k, v in row.items() if not k.startswith("_")} for _, _, row in scored[:limit]]
+    return rows, best_matched
+
+
 # ------------------------------------------------------------------ catalog --
 
 
+@dataclass
+class SearchResult:
+    """Ranked catalog hits, plus how well they matched.
+
+    `matched_terms` lets the caller distinguish a confident hit from a partial
+    one, so a model is told when nothing matched every word it asked for rather
+    than being handed the best of a weak set as though it were exact.
+    """
+
+    rows: list[dict[str, Any]] = field(default_factory=list)
+    matched_terms: int = 0
+    total_terms: int = 0
+    ranked: bool = True
+
+    @property
+    def matched_all(self) -> bool:
+        return self.total_terms > 0 and self.matched_terms >= self.total_terms
+
+
 @timed("search_tables")
-async def search_tables(terms: str, top: int, language: str | None = None) -> list[dict[str, Any]]:
+async def search_tables(terms: str, top: int, language: str | None = None) -> SearchResult:
     """Search the StatLine catalog. Every word must match title or description.
 
     CBS publishes the catalog in two languages - about 4900 Dutch tables and
@@ -471,8 +635,19 @@ async def search_tables(terms: str, top: int, language: str | None = None) -> li
     circles back to a phrase it already tried pays nothing the second time.
     """
 
-    async def fetch() -> list[dict[str, Any]]:
-        return await _search_tables_uncached(terms, top, language)
+    async def fetch() -> SearchResult:
+        try:
+            index = await get_catalog_index()
+        except CbsError:
+            # If the index cannot be built, fall back to letting the API filter.
+            # Worse results beat no results.
+            log.warning("catalog index unavailable; falling back to server-side filtering")
+            rows = await _search_tables_uncached(terms, top, language)
+            return SearchResult(rows=rows, matched_terms=0, total_terms=0, ranked=False)
+        rows, matched = rank_tables(index, terms, language, top)
+        return SearchResult(
+            rows=rows, matched_terms=matched, total_terms=len(_tokens(terms)), ranked=True
+        )
 
     return await _search_cache.get_or_fetch((terms.strip().lower(), top, language), fetch)
 
